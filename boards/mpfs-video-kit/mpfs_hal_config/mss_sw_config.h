@@ -175,6 +175,9 @@
 #define LIBERO_SETTING_CONTEXT_A_HART_EN    0x0000000EUL    /* harts 1 to 3 */
 #define LIBERO_SETTING_CONTEXT_B_HART_EN    0x00000010UL    /* hart 4 */
 
+#undef LIBERO_SETTING_MSS_CLOCK_CONFIG_CR_LOW
+#define LIBERO_SETTING_MSS_CLOCK_CONFIG_CR_LOW 0x0000003FUL /* CPU=/8, AXI=/8, AHB/APB=/8 */
+
 #define LIBERO_SETTING_FPGA_SWITCH_ADDRESS 0 /* not used in MPFS-Video kit but define
                                                 required */
 

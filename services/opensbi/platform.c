@@ -32,6 +32,7 @@
 
 #include "config.h"
 #include "hss_types.h"
+#include "mss_pll.h"
 
 #include <assert.h>
 
@@ -69,6 +70,7 @@
 #include "reboot_service.h"
 #include "hss_boot_service.h"
 #include "clocks/hw_mss_clks.h"    // LIBERO_SETTING_MSS_RTC_TOGGLE_CLK
+#include "memory_map/hw_apb_split.h"
 #include "hss_clock.h"
 
 #define MPFS_HART_COUNT            5
@@ -86,6 +88,30 @@
 
 #define MPFS_ACLINT_MTIMER_FREQ    LIBERO_SETTING_MSS_RTC_TOGGLE_CLK
 #define MPFS_ACLINT_MTIMER_ADDR    (0x02004000)
+
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_CLOCK_SCALING)
+#define MPFS_MMUART0_LO_BASE       0x20000000UL
+#define MPFS_MMUART0_HI_BASE       0x28000000UL
+#if (LIBERO_SETTING_APBBUS_CR & 0x1UL)
+#  define MPFS_MMUART0_BASE        MPFS_MMUART0_HI_BASE
+#else
+#  define MPFS_MMUART0_BASE        MPFS_MMUART0_LO_BASE
+#endif
+
+#define MPFS_MMUART_DLR_OFFSET     0x00UL
+#define MPFS_MMUART_DMR_OFFSET     0x04UL
+#define MPFS_MMUART_LCR_OFFSET     0x0cUL
+#define MPFS_MMUART_LSR_OFFSET     0x14UL
+#define MPFS_MMUART_MM0_OFFSET     0x30UL
+#define MPFS_MMUART_DFR_OFFSET     0x3cUL
+
+#define MPFS_MMUART_LCR_DLAB       (1u << 7u)
+#define MPFS_MMUART_LSR_TEMT       (1u << 6u)
+#define MPFS_MMUART_MM0_EFBR       (1u << 7u)
+#define MPFS_MMUART_DFR_MASK       0x3fU
+
+#define MPFS_MMUART0_SUSPEND_CLOCK_DIVISOR 2UL
+#endif
 
 /**
  * PolarFire SoC has 5 HARTs but HART ID 0 doesn't have S mode. enable only
@@ -139,6 +165,113 @@ static size_t num_sbi_domains = 0u;
  * out in plic.c to allow external use; declare them here at file scope. */
 extern void plic_set_ie(const struct plic_data *plic, u32 cntxid, u32 word_index, u32 val);
 extern void plic_set_thresh(const struct plic_data *plic, u32 cntxid, u32 val);
+
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_CLOCK_SCALING)
+static uint8_t mpfs_mmuart0_read8(unsigned long offset)
+{
+    return *(volatile uint8_t *)(MPFS_MMUART0_BASE + offset);
+}
+
+static void mpfs_mmuart0_write8(unsigned long offset, uint8_t value)
+{
+    *(volatile uint8_t *)(MPFS_MMUART0_BASE + offset) = value;
+}
+
+static void mpfs_mmuart0_wait_tx_empty(void)
+{
+    while ((mpfs_mmuart0_read8(MPFS_MMUART_LSR_OFFSET) & MPFS_MMUART_LSR_TEMT) == 0u) {
+        ;
+    }
+}
+
+static struct {
+    uint8_t dfr;
+    uint8_t dlr;
+    uint8_t dmr;
+    uint8_t lcr;
+    uint8_t mm0;
+} saved_mmuart0_baudrate;
+
+static void mpfs_mmuart0_save_baudrate(void)
+{
+    saved_mmuart0_baudrate.lcr = mpfs_mmuart0_read8(MPFS_MMUART_LCR_OFFSET);
+    saved_mmuart0_baudrate.mm0 = mpfs_mmuart0_read8(MPFS_MMUART_MM0_OFFSET);
+    saved_mmuart0_baudrate.dfr = mpfs_mmuart0_read8(MPFS_MMUART_DFR_OFFSET);
+
+    mpfs_mmuart0_write8(MPFS_MMUART_LCR_OFFSET,
+        saved_mmuart0_baudrate.lcr | MPFS_MMUART_LCR_DLAB);
+    saved_mmuart0_baudrate.dmr = mpfs_mmuart0_read8(MPFS_MMUART_DMR_OFFSET);
+    saved_mmuart0_baudrate.dlr = mpfs_mmuart0_read8(MPFS_MMUART_DLR_OFFSET);
+    mpfs_mmuart0_write8(MPFS_MMUART_LCR_OFFSET, saved_mmuart0_baudrate.lcr);
+}
+
+static void mpfs_mmuart0_restore_baudrate(void)
+{
+    uint8_t lcr = mpfs_mmuart0_read8(MPFS_MMUART_LCR_OFFSET);
+
+    mpfs_mmuart0_write8(MPFS_MMUART_LCR_OFFSET, lcr | MPFS_MMUART_LCR_DLAB);
+    mpfs_mmuart0_write8(MPFS_MMUART_DMR_OFFSET, saved_mmuart0_baudrate.dmr);
+    mpfs_mmuart0_write8(MPFS_MMUART_DLR_OFFSET, saved_mmuart0_baudrate.dlr);
+    mpfs_mmuart0_write8(MPFS_MMUART_LCR_OFFSET, saved_mmuart0_baudrate.lcr);
+
+    mpfs_mmuart0_write8(MPFS_MMUART_DFR_OFFSET, saved_mmuart0_baudrate.dfr);
+    mpfs_mmuart0_write8(MPFS_MMUART_MM0_OFFSET, saved_mmuart0_baudrate.mm0);
+}
+
+static void mpfs_mmuart0_scale_baudrate(uint64_t old_pclk_hz,
+    uint64_t new_pclk_hz)
+{
+    const uint32_t old_divisor =
+        ((uint32_t)saved_mmuart0_baudrate.dmr << 8u)
+        | saved_mmuart0_baudrate.dlr;
+    const uint8_t lcr = mpfs_mmuart0_read8(MPFS_MMUART_LCR_OFFSET);
+    uint64_t divisor_by_64;
+    uint64_t new_divisor_by_64;
+    uint32_t new_divisor;
+    uint32_t fractional_divisor;
+
+    if (old_pclk_hz == 0u || new_pclk_hz == 0u || old_divisor == 0u) {
+        return;
+    }
+
+    divisor_by_64 = (uint64_t)old_divisor * 64u;
+    if ((saved_mmuart0_baudrate.mm0 & MPFS_MMUART_MM0_EFBR) != 0u) {
+        divisor_by_64 += saved_mmuart0_baudrate.dfr
+            & MPFS_MMUART_DFR_MASK;
+    }
+
+    new_divisor_by_64 = (divisor_by_64 * new_pclk_hz
+        + (old_pclk_hz / 2u)) / old_pclk_hz;
+    new_divisor = (uint32_t)(new_divisor_by_64 / 64u);
+    fractional_divisor = (uint32_t)(new_divisor_by_64 % 64u);
+
+    if (new_divisor == 0u || new_divisor > 0xffffu) {
+        return;
+    }
+
+    mpfs_mmuart0_write8(MPFS_MMUART_LCR_OFFSET, lcr | MPFS_MMUART_LCR_DLAB);
+    mpfs_mmuart0_write8(MPFS_MMUART_DMR_OFFSET,
+        (uint8_t)(new_divisor >> 8u));
+    mpfs_mmuart0_write8(MPFS_MMUART_DLR_OFFSET, (uint8_t)new_divisor);
+    mpfs_mmuart0_write8(MPFS_MMUART_LCR_OFFSET, lcr);
+
+    if (new_divisor > 1u) {
+        mpfs_mmuart0_write8(MPFS_MMUART_MM0_OFFSET,
+            mpfs_mmuart0_read8(MPFS_MMUART_MM0_OFFSET) | MPFS_MMUART_MM0_EFBR);
+        mpfs_mmuart0_write8(MPFS_MMUART_DFR_OFFSET,
+            (uint8_t)fractional_divisor);
+    } else {
+        mpfs_mmuart0_write8(MPFS_MMUART_MM0_OFFSET,
+            mpfs_mmuart0_read8(MPFS_MMUART_MM0_OFFSET) & (uint8_t)~MPFS_MMUART_MM0_EFBR);
+    }
+}
+
+static void mpfs_mmuart0_set_suspend_baudrate(void)
+{
+    mpfs_mmuart0_scale_baudrate(LIBERO_SETTING_MSS_APB_AHB_CLK,
+        LIBERO_SETTING_MSS_APB_AHB_CLK / MPFS_MMUART0_SUSPEND_CLOCK_DIVISOR);
+}
+#endif
 
 static void mpfs_modify_dt(void *fdt)
 {
@@ -704,6 +837,12 @@ void mpfs_system_suspend(void)
         }
         mHSS_DEBUG_PRINTF(LOG_WARN, "%s: self_refresh active\n", __func__);
     }
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_CLOCK_SCALING)
+    mpfs_mmuart0_wait_tx_empty();
+    mpfs_mmuart0_save_baudrate();
+    mss_freq_scaling(MSS_CLK_SCALING_LOW);
+    mpfs_mmuart0_set_suspend_baudrate();
+#endif
 }
 
 void mpfs_system_resume(void)
@@ -718,6 +857,11 @@ void mpfs_system_resume(void)
 
         mHSS_DEBUG_PRINTF(LOG_WARN, "%s: self_refresh inactive\n", __func__);
     }
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_CLOCK_SCALING)
+    mpfs_mmuart0_wait_tx_empty();
+    mss_freq_scaling(MSS_CLK_SCALING_NORMAL);
+    mpfs_mmuart0_restore_baudrate();
+#endif
 }
 
 const struct sbi_hsm_device mpfs_hsm = {

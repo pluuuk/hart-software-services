@@ -55,6 +55,16 @@ config SERVICE_OPENSBI_CRYPTO
 
 	  If you do not know what to do here, say Y.
 
+config SERVICE_OPENSBI_SUSPEND_CLOCK_SCALING
+	bool "Scale MSS clocks during system suspend"
+	default n
+	depends on SERVICE_OPENSBI
+	help
+	  This feature lowers CPU, AXI and AHB/APB clocks while Linux is
+	  suspended, and retunes MMUART0 around the clock change.
+
+	  If you do not know what to do here, say N.
+
 config OPENSBI_SRC_DIR
 	string
 	option env="OPENSBI_SRC_DIR"
