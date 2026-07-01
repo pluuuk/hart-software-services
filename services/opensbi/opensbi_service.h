@@ -62,6 +62,9 @@ void mpfs_system_suspend(void);
 void mpfs_system_resume(void);
 void mpfs_set_suspended_hartid(u32 hartid);
 u32 mpfs_get_suspended_hartid(void);
+#if defined(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+bool mpfs_is_hart_parked(u32 hartid);
+#endif
 bool mpfs_are_harts_in_same_domain(int hartid1, int hartid2);
 bool mpfs_is_cold_reboot_allowed(int hartid);
 bool mpfs_is_warm_reboot_allowed(int hartid);

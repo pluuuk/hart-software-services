@@ -65,6 +65,18 @@ config SERVICE_OPENSBI_SUSPEND_CLOCK_SCALING
 
 	  If you do not know what to do here, say N.
 
+config SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE
+	bool "Enable DDR power saving during system suspend"
+	default n
+	depends on SERVICE_OPENSBI && !SKIP_DDR
+	help
+	  This feature enables the tested DDR suspend power sequence:
+	  disable DRAM clocks through the DDR controller while in
+	  self-refresh, put DDR logic in low power, gate DDR PLL outputs,
+	  and gate the DDRC sub-block clock until resume.
+
+	  If you do not know what to do here, say N.
+
 config OPENSBI_SRC_DIR
 	string
 	option env="OPENSBI_SRC_DIR"

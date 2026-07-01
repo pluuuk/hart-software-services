@@ -26,7 +26,10 @@
 #include <sbi/riscv_asm.h>
 #include <sbi/riscv_barrier.h>
 
+#if !IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
 #include <u54_state.h>
+#endif
+
 #include "hss_trigger.h"
 #include "opensbi_service.h"
 #include "opensbi_suspend_ecall.h"
@@ -41,15 +44,26 @@ int sbi_ecall_susp_handler(unsigned long extid, unsigned long funcid,
     case SBI_EXT_SUSP_SYSTEM_SUSPEND:
         mpfs_set_suspended_hartid(current_hartid());
         if (1 == mpfs_domains_get_count()) {
-           // Wait for all secondary harts to reach spin_forever (Idle) before touching DDR
-           const struct sbi_domain *dom = sbi_domain_thishart_ptr();
-           int h;
-           sbi_hartmask_for_each_hart(h, dom->possible_harts) {
-               if (h == current_hartid()) continue; // boot hart is still running
-               while (HSS_U54_GetState_Ex(h) != HSS_State_Idle) {
-                   ;
-               }
-           }
+            /*
+             * Wait for all secondary harts to reach the HSS WFI loop
+             * before touching DDR.
+             */
+            const struct sbi_domain *dom = sbi_domain_thishart_ptr();
+            int h;
+            sbi_hartmask_for_each_hart(h, dom->possible_harts) {
+                if (h == current_hartid()) {
+                    continue;
+                }
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+                while (!mpfs_is_hart_parked(h)) {
+                    ;
+                }
+#else
+                while (HSS_U54_GetState_Ex(h) != HSS_State_Idle) {
+                    ;
+                }
+#endif
+            }
 
             mpfs_system_suspend();
 

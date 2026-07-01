@@ -72,6 +72,7 @@
 #include "clocks/hw_mss_clks.h"    // LIBERO_SETTING_MSS_RTC_TOGGLE_CLK
 #include "memory_map/hw_apb_split.h"
 #include "hss_clock.h"
+#include "mss_sysreg.h"
 
 #define MPFS_HART_COUNT            5
 #define MPFS_HART_STACK_SIZE       8192
@@ -111,6 +112,12 @@
 #define MPFS_MMUART_DFR_MASK       0x3fU
 
 #define MPFS_MMUART0_SUSPEND_CLOCK_DIVISOR 2UL
+#endif
+
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+#define MPFS_DDR_LOW_POWER_OPTIONS 0x1fU
+/* MC_BASE2.CFG_DRAM_CLK_DISABLE_IN_SELF_REFRESH is at DDRC offset 0x4310. */
+#define MPFS_DDRC_CFG_DRAM_CLK_DISABLE_SR_OFFSET 0x4310U
 #endif
 
 /**
@@ -156,7 +163,10 @@ static struct {
     int reset_reason;
     bool allow_cold_reboot;
     bool allow_warm_reboot;
-    bool has_stopped;   /* secondary hart has taken j _start; now in HSS SSMB loop, not OpenSBI WFI */
+    bool has_stopped;
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+    bool parked;
+#endif
 } hart_ledger[MAX_NUM_HARTS] = { { { 0, }, } };
 
 static size_t num_sbi_domains = 0u;
@@ -564,7 +574,10 @@ void mpfs_domains_register_hart(int hartid, int boot_hartid)
 
     hart_ledger[hartid].reset_reason = 0;
     hart_ledger[hartid].reset_type = 0;
-    hart_ledger[hartid].has_stopped = false;
+    __atomic_store_n(&hart_ledger[hartid].has_stopped, false, __ATOMIC_RELAXED);
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+    __atomic_store_n(&hart_ledger[hartid].parked, false, __ATOMIC_RELAXED);
+#endif
 }
 
 void mpfs_domains_deregister_hart(int hartid)
@@ -697,14 +710,21 @@ static int mpfs_hart_start(u32 hartid, ulong saddr)
 {
     (void)saddr;
 
-    if (hart_ledger[hartid].owner_hartid != hartid && hart_ledger[hartid].has_stopped) {
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+    __atomic_store_n(&hart_ledger[hartid].parked, false, __ATOMIC_RELEASE);
+#endif
+
+    if (hart_ledger[hartid].owner_hartid != hartid &&
+            __atomic_load_n(&hart_ledger[hartid].has_stopped,
+                __ATOMIC_ACQUIRE)) {
         /*
          * Secondary hart took j _start on a previous HART_STOP and is now
          * sitting in HSS's IPI loop.  Ask E51 to send IPI_MSG_GOTO to it.
          * We advance HSM state START_PENDING -> STARTED here because the hart
          * will not go through OpenSBI init_warm_startup() path.
          */
-        hart_ledger[hartid].has_stopped = false;
+        __atomic_store_n(&hart_ledger[hartid].has_stopped, false,
+            __ATOMIC_RELEASE);
         struct sbi_scratch *rscratch = sbi_hartid_to_scratch(hartid);
         sbi_hsm_prepare_next_jump(rscratch, hartid);
 
@@ -784,19 +804,23 @@ static int mpfs_hart_stop(void)
          * part of a system reboot (E51 will send IPI_MSG_GOTO to the
          * payload) or after system suspend resume (mpfs_hart_start() will
          * ask E51 to send IPI_MSG_GOTO with the Linux resume address).
-          *
+         *
          * Using j _start here instead of jump_warmboot() is necessary
          * because E51 communicates via SSMB, not via raw software IPIs,
          * so the hart must be in HSS IPI processing loop to receive it.
          */
-        hart_ledger[hartid].has_stopped = true;
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+        __atomic_store_n(&hart_ledger[hartid].parked, false, __ATOMIC_RELEASE);
+#endif
+        __atomic_store_n(&hart_ledger[hartid].has_stopped, true,
+            __ATOMIC_RELEASE);
         asm("j _start");
         __builtin_unreachable();
     }
 
     /*
      * Boot hart, plain SBI_EXT_HSM_HART_STOP (parked by Linux):
-     * use the * warmboot path so it blocks in sbi_hsm_hart_wait().
+     * use the warmboot path so it blocks in sbi_hsm_hart_wait().
      * mpfs_hart_start() wakes it with sbi_ipi_raw_send().
      */
     jump_warmboot();
@@ -811,30 +835,122 @@ bool mpfs_is_first_boot(void)
     return (atomic_xchg(&coldboot_lottery, 1) == 0);
 }
 
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+void mpfs_mark_hart_parked(void);
+void mpfs_mark_hart_parked(void)
+{
+    const u32 hartid = current_hartid();
+
+    if (hartid == HSS_HART_E51 || hartid >= ARRAY_SIZE(hart_ledger)) {
+        return;
+    }
+
+    __atomic_store_n(&hart_ledger[hartid].parked, true, __ATOMIC_RELEASE);
+}
+
+bool mpfs_is_hart_parked(u32 hartid)
+{
+    assert(hartid < ARRAY_SIZE(hart_ledger));
+
+    return __atomic_load_n(&hart_ledger[hartid].parked, __ATOMIC_ACQUIRE);
+}
+#endif
+
 static uint32_t suspended_hartid = 0u;
 
 void mpfs_set_suspended_hartid(uint32_t hartid)
 {
-    suspended_hartid = hartid;
+    __atomic_store_n(&suspended_hartid, hartid, __ATOMIC_RELEASE);
 }
 
 u32 mpfs_get_suspended_hartid(void)
 {
-    return suspended_hartid;
+    return __atomic_load_n(&suspended_hartid, __ATOMIC_ACQUIRE);
 }
 
 extern void mpfs_hal_turn_ddr_selfrefresh_on(void);
 extern void mpfs_hal_turn_ddr_selfrefresh_off(void);
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+extern void mpfs_hal_ddr_logic_power_state(uint32_t, uint32_t);
+extern void flush_l2_cache(uint32_t);
+#endif
+
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+static uint32_t mpfs_ddr_sr_read32(uint32_t offset)
+{
+    return *(volatile uint32_t *)((uintptr_t)MSS_DDRC_BASE_ADDR + offset);
+}
+
+static void mpfs_ddr_sr_write32(uint32_t offset, uint32_t value)
+{
+    *(volatile uint32_t *)((uintptr_t)MSS_DDRC_BASE_ADDR + offset) = value;
+}
+
+static uint32_t saved_ddr_dram_clk_disable_sr;
+
+static void mpfs_ddr_enable_clk_disable_in_sr(void)
+{
+    saved_ddr_dram_clk_disable_sr =
+        mpfs_ddr_sr_read32(MPFS_DDRC_CFG_DRAM_CLK_DISABLE_SR_OFFSET);
+    mpfs_ddr_sr_write32(MPFS_DDRC_CFG_DRAM_CLK_DISABLE_SR_OFFSET, 1U);
+    mb();
+}
+
+static void mpfs_ddr_restore_clk_disable_in_sr(void)
+{
+    mpfs_ddr_sr_write32(MPFS_DDRC_CFG_DRAM_CLK_DISABLE_SR_OFFSET,
+        saved_ddr_dram_clk_disable_sr);
+    mb();
+}
+
+static uint32_t saved_ddrc_clock_cr;
+static bool ddrc_clock_cr_saved = false;
+
+static void mpfs_suspend_ddrc_clock(void)
+{
+    if (ddrc_clock_cr_saved) {
+        return;
+    }
+
+    saved_ddrc_clock_cr = SYSREG->SUBBLK_CLOCK_CR;
+    ddrc_clock_cr_saved = true;
+
+    SYSREG->SUBBLK_CLOCK_CR =
+        saved_ddrc_clock_cr & ~SUBBLK_CLOCK_CR_DDRC_MASK;
+    mb();
+}
+
+static void mpfs_resume_ddrc_clock(void)
+{
+    if (!ddrc_clock_cr_saved) {
+        return;
+    }
+
+    SYSREG->SUBBLK_CLOCK_CR = saved_ddrc_clock_cr;
+    mb();
+
+    ddrc_clock_cr_saved = false;
+}
+#endif
 
 void mpfs_system_suspend(void)
 {
     if (!IS_ENABLED(CONFIG_SKIP_DDR)) {
         volatile uint32_t * const self_refresh_status_reg =
             (volatile uint32_t *)(MSS_DDRC_BASE_ADDR + MSS_DDRC_SELF_REFRESH_STATUS_OFFSET);
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+        flush_l2_cache((uint32_t)1U);
+        mpfs_ddr_enable_clk_disable_in_sr();
+#endif
+
         mpfs_hal_turn_ddr_selfrefresh_on();
         while ((*self_refresh_status_reg & MSS_DDRC_SELF_REFRESH_ACK_BIT) == 0u) {
             ; // poll INIT_SELF_REFRESH_STATUS bit until DDRC ACKs entry
         }
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+        mpfs_hal_ddr_logic_power_state(0, MPFS_DDR_LOW_POWER_OPTIONS);
+        mpfs_suspend_ddrc_clock();
+#endif
         mHSS_DEBUG_PRINTF(LOG_WARN, "%s: self_refresh active\n", __func__);
     }
 #if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_CLOCK_SCALING)
@@ -850,11 +966,18 @@ void mpfs_system_resume(void)
     if (!IS_ENABLED(CONFIG_SKIP_DDR)) {
         volatile uint32_t * const self_refresh_status_reg =
             (volatile uint32_t *)(MSS_DDRC_BASE_ADDR + MSS_DDRC_SELF_REFRESH_STATUS_OFFSET);
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+        mpfs_resume_ddrc_clock();
+        mpfs_hal_ddr_logic_power_state(1, MPFS_DDR_LOW_POWER_OPTIONS);
+#endif
         mpfs_hal_turn_ddr_selfrefresh_off();
         while ((*self_refresh_status_reg & MSS_DDRC_SELF_REFRESH_ACK_BIT) != 0u) {
             ;
         }
-
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+        mpfs_ddr_restore_clk_disable_in_sr();
+        flush_l2_cache((uint32_t)1U);
+#endif
         mHSS_DEBUG_PRINTF(LOG_WARN, "%s: self_refresh inactive\n", __func__);
     }
 #if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_CLOCK_SCALING)
