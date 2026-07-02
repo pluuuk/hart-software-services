@@ -65,6 +65,16 @@ config SERVICE_OPENSBI_SUSPEND_CLOCK_SCALING
 
 	  If you do not know what to do here, say N.
 
+config SERVICE_OPENSBI_SUSPEND_SCB_CLOCK_SWITCH
+	bool "Switch MSS to the SCB clock during system suspend"
+	default n
+	depends on SERVICE_OPENSBI_SUSPEND_CLOCK_SCALING
+	help
+	  This feature switches clk_in_mss to the 80 MHz SCB standby clock
+	  while Linux is suspended, then disables the MSS PLL Q0 output.
+
+	  If you do not know what to do here, say N.
+
 config SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE
 	bool "Enable DDR power saving during system suspend"
 	default n

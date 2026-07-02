@@ -112,6 +112,17 @@
 #define MPFS_MMUART_DFR_MASK       0x3fU
 
 #define MPFS_MMUART0_SUSPEND_CLOCK_DIVISOR 2UL
+
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_SCB_CLOCK_SWITCH)
+#define MPFS_SCB_CLOCK_HZ          80000000UL
+#define MPFS_IOSCB_PLL_MSS_PLL_CTRL ((volatile void *)0x3e001004UL)
+#define MPFS_IOSCB_MSS_MUX_MSSCLKMUX ((volatile void *)0x3e00200cUL)
+#define MPFS_MSSCLKMUX_SEL_MASK    0x3UL
+#define MPFS_MSS_PLL_CTRL_STATUS_MASK \
+    (PLL_CTRL_LOCK_BIT | (1UL << 28U) | (1UL << 29U) | (1UL << 31U))
+#define MPFS_MSS_PLL_LOCK_TIMEOUT  1000000UL
+#define MPFS_CLOCK_MUX_SETTLE_LOOPS 100U
+#endif
 #endif
 
 #if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
@@ -276,11 +287,99 @@ static void mpfs_mmuart0_scale_baudrate(uint64_t old_pclk_hz,
     }
 }
 
+#if !IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_SCB_CLOCK_SWITCH)
 static void mpfs_mmuart0_set_suspend_baudrate(void)
 {
     mpfs_mmuart0_scale_baudrate(LIBERO_SETTING_MSS_APB_AHB_CLK,
         LIBERO_SETTING_MSS_APB_AHB_CLK / MPFS_MMUART0_SUSPEND_CLOCK_DIVISOR);
 }
+#endif
+
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_SCB_CLOCK_SWITCH)
+static uint32_t saved_mssclkmux;
+static uint32_t saved_mss_pll_ctrl;
+static bool scb_clock_state_saved = false;
+
+static void mpfs_clock_mux_settle(void)
+{
+    volatile uint32_t delay;
+
+    for (delay = 0u; delay < MPFS_CLOCK_MUX_SETTLE_LOOPS; delay++) {
+        ;
+    }
+}
+
+static void mpfs_mmuart0_set_scb_baudrate(void)
+{
+    mpfs_mmuart0_scale_baudrate(LIBERO_SETTING_MSS_APB_AHB_CLK,
+        MPFS_SCB_CLOCK_HZ / 8UL);
+}
+
+static uint32_t mpfs_mss_pll_ctrl_for_write(uint32_t pll_ctrl)
+{
+    return pll_ctrl & ~MPFS_MSS_PLL_CTRL_STATUS_MASK;
+}
+
+static void mpfs_suspend_scb_clock(void)
+{
+    if (scb_clock_state_saved) {
+        return;
+    }
+
+    saved_mssclkmux = readl(MPFS_IOSCB_MSS_MUX_MSSCLKMUX);
+    saved_mss_pll_ctrl = readl(MPFS_IOSCB_PLL_MSS_PLL_CTRL);
+    scb_clock_state_saved = true;
+
+    mss_freq_scaling(MSS_CLK_SCALING_LOW);
+    writel(saved_mssclkmux & ~MPFS_MSSCLKMUX_SEL_MASK,
+        MPFS_IOSCB_MSS_MUX_MSSCLKMUX);
+    mb();
+    mpfs_clock_mux_settle();
+
+    writel(mpfs_mss_pll_ctrl_for_write(saved_mss_pll_ctrl &
+        ~PLL_CTRL_REG_DIVQ0_EN_MASK), MPFS_IOSCB_PLL_MSS_PLL_CTRL);
+    mb();
+}
+
+static bool mpfs_mss_pll_is_locked(void)
+{
+    uint32_t timeout;
+
+    for (timeout = 0u; timeout < MPFS_MSS_PLL_LOCK_TIMEOUT; timeout++) {
+        if ((readl(MPFS_IOSCB_PLL_MSS_PLL_CTRL) &
+            PLL_CTRL_LOCK_BIT) != 0u) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void mpfs_resume_scb_clock(void)
+{
+    if (!scb_clock_state_saved) {
+        return;
+    }
+
+    writel(mpfs_mss_pll_ctrl_for_write(saved_mss_pll_ctrl),
+        MPFS_IOSCB_PLL_MSS_PLL_CTRL);
+    mb();
+    if (!mpfs_mss_pll_is_locked()) {
+        mHSS_DEBUG_PRINTF(LOG_ERROR, "MSS PLL failed to lock\n");
+        assert(0);
+        while (1) {
+            wfi();
+        }
+    }
+
+    writel(saved_mssclkmux, MPFS_IOSCB_MSS_MUX_MSSCLKMUX);
+    mb();
+    mpfs_clock_mux_settle();
+    mss_freq_scaling(MSS_CLK_SCALING_NORMAL);
+
+    scb_clock_state_saved = false;
+}
+#endif
 #endif
 
 static void mpfs_modify_dt(void *fdt)
@@ -956,8 +1055,13 @@ void mpfs_system_suspend(void)
 #if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_CLOCK_SCALING)
     mpfs_mmuart0_wait_tx_empty();
     mpfs_mmuart0_save_baudrate();
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_SCB_CLOCK_SWITCH)
+    mpfs_suspend_scb_clock();
+    mpfs_mmuart0_set_scb_baudrate();
+#else
     mss_freq_scaling(MSS_CLK_SCALING_LOW);
     mpfs_mmuart0_set_suspend_baudrate();
+#endif
 #endif
 }
 
@@ -982,7 +1086,11 @@ void mpfs_system_resume(void)
     }
 #if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_CLOCK_SCALING)
     mpfs_mmuart0_wait_tx_empty();
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_SCB_CLOCK_SWITCH)
+    mpfs_resume_scb_clock();
+#else
     mss_freq_scaling(MSS_CLK_SCALING_NORMAL);
+#endif
     mpfs_mmuart0_restore_baudrate();
 #endif
 }
