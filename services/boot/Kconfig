@@ -75,6 +75,7 @@ config SERVICE_BOOT_SNVM
 config SERVICE_BOOT_SNVM_START_PAGE
     int "sNVM start page"
     default 0
+    range 0 220
     depends on SERVICE_BOOT_SNVM
     help
                 First sNVM page (module index) where the HSS payload is stored.
@@ -83,6 +84,7 @@ config SERVICE_BOOT_SNVM_START_PAGE
 config SERVICE_BOOT_SNVM_PAGE_COUNT
     int "sNVM page count"
     default 221
+    range 1 221
     depends on SERVICE_BOOT_SNVM
     help
                 Number of sNVM pages to read. Maximum 221 pages (55,692 bytes

@@ -27,6 +27,10 @@
 #  include <mss_sys_services.h>
 #endif
 
+#if IS_ENABLED(CONFIG_SERVICE_BOOT_SNVM)
+#  include "fpga_design_config/memory_map/hw_nvm_map.h"
+#endif
+
 #if IS_ENABLED(CONFIG_SERVICE_SPI)
 #  define SPI_FLASH_BOOT_ENABLED (CONFIG_SERVICE_BOOT_SPI_FLASH_OFFSET != 0xFFFFFFFF)
 #else
@@ -634,6 +638,14 @@ void HSS_BootSelectSPI(void)
 #if IS_ENABLED(CONFIG_SERVICE_BOOT_SNVM)
 #define SNVM_PAGE_SIZE_NON_AUTH  252u
 #define SNVM_MAX_PAGES           221u
+
+#if (CONFIG_SERVICE_BOOT_SNVM_START_PAGE >= SNVM_MAX_PAGES)
+#  error "CONFIG_SERVICE_BOOT_SNVM_START_PAGE is out of range"
+#endif
+#if ((CONFIG_SERVICE_BOOT_SNVM_PAGE_COUNT == 0) || \
+     (CONFIG_SERVICE_BOOT_SNVM_PAGE_COUNT > SNVM_MAX_PAGES))
+#  error "CONFIG_SERVICE_BOOT_SNVM_PAGE_COUNT is out of range"
+#endif
 #endif
 
 static bool getBootImageFromSNVM_(struct HSS_Storage *pStorage, struct HSS_BootImage **ppBootImage)
@@ -646,12 +658,36 @@ static bool getBootImageFromSNVM_(struct HSS_Storage *pStorage, struct HSS_BootI
 
     const uint8_t startPage = (uint8_t)CONFIG_SERVICE_BOOT_SNVM_START_PAGE;
     const uint8_t pageCount = (uint8_t)CONFIG_SERVICE_BOOT_SNVM_PAGE_COUNT;
+    const uint16_t endPage = (uint16_t)startPage + pageCount - 1u;
+    const uint8_t liberoStartPage = (uint8_t)LIBERO_SETTING_SNVM_MSS_START_PAGE;
+    const uint8_t liberoEndPage = (uint8_t)LIBERO_SETTING_SNVM_MSS_END_PAGE;
+    const size_t bytesRead = (size_t)pageCount * SNVM_PAGE_SIZE_NON_AUTH;
     uint8_t *pDest = (uint8_t *)(CONFIG_SERVICE_BOOT_SNVM_STAGING_ADDR);
     uint8_t admin[4];
     uint16_t status;
 
-    mHSS_DEBUG_PRINTF(LOG_NORMAL, "Reading %u sNVM pages (%u bytes) to 0x%lx ...\n",
-        pageCount, (unsigned)(pageCount * SNVM_PAGE_SIZE_NON_AUTH), (uintptr_t)pDest);
+    mHSS_DEBUG_PRINTF(LOG_NORMAL, "Reading %u sNVM pages (%lu bytes) to 0x%lx ...\n",
+        pageCount, (unsigned long)bytesRead, (uintptr_t)pDest);
+
+    if (bytesRead < sizeof(struct HSS_BootImage)) {
+        mHSS_DEBUG_PRINTF(LOG_ERROR, "sNVM read size %lu is smaller than header %lu\n",
+            (unsigned long)bytesRead, (unsigned long)sizeof(struct HSS_BootImage));
+        return false;
+    }
+
+    if (endPage >= SNVM_MAX_PAGES) {
+        mHSS_DEBUG_PRINTF(LOG_ERROR, "sNVM page range %u-%u exceeds max %u\n",
+            (unsigned int)startPage, (unsigned int)endPage, SNVM_MAX_PAGES - 1u);
+        return false;
+    }
+
+    if ((startPage < liberoStartPage) || (endPage > liberoEndPage)) {
+        mHSS_DEBUG_PRINTF(LOG_ERROR,
+            "sNVM page range %u-%u outside Libero MSS range %u-%u\n",
+            (unsigned int)startPage, (unsigned int)endPage,
+            (unsigned int)liberoStartPage, (unsigned int)liberoEndPage);
+        return false;
+    }
 
     MSS_SYS_select_service_mode(MSS_SYS_SERVICE_POLLING_MODE, NULL);
 
@@ -660,12 +696,6 @@ static bool getBootImageFromSNVM_(struct HSS_Storage *pStorage, struct HSS_BootI
 
     for (uint8_t page = 0u; page < pageCount; page++) {
         uint8_t moduleIdx = startPage + page;
-
-        if (moduleIdx >= SNVM_MAX_PAGES) {
-            mHSS_DEBUG_PRINTF(LOG_ERROR, "sNVM page %u exceeds max (%u)\n",
-                moduleIdx, SNVM_MAX_PAGES);
-            break;
-        }
 
         status = MSS_SYS_secure_nvm_read(
             moduleIdx,
@@ -692,10 +722,16 @@ static bool getBootImageFromSNVM_(struct HSS_Storage *pStorage, struct HSS_BootI
     *ppBootImage = (struct HSS_BootImage *)(CONFIG_SERVICE_BOOT_SNVM_STAGING_ADDR);
     result = HSS_Boot_VerifyMagic(*ppBootImage);
 
+    if (result && ((*ppBootImage)->bootImageLength > bytesRead)) {
+        mHSS_DEBUG_PRINTF(LOG_ERROR, "sNVM payload length %lu exceeds bytes read %lu\n",
+            (unsigned long)(*ppBootImage)->bootImageLength, (unsigned long)bytesRead);
+        result = false;
+    }
+
     if (result) {
         printBootImageDetails_(*ppBootImage);
     } else {
-        mHSS_DEBUG_PRINTF(LOG_ERROR, "sNVM payload magic verification failed\n");
+        mHSS_DEBUG_PRINTF(LOG_ERROR, "sNVM payload verification failed\n");
     }
 #endif
 
