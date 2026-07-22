@@ -70,12 +70,16 @@ _start:
 	csrw	CSR_MSCRATCH, 0
 
 .configure:
-	li	a0, 0
-	la	a1, decompress_done_flag
-	REG_S	a0, 0(a1)
+	csrr	a0, CSR_MHARTID
+	bnez	a0, .common_configure
 
+	fence	rw, rw
+	li	a2, 0
+	la	a1, decompress_done_flag
+	REG_S	a2, 0(a1)
+
+.common_configure:
 	la	s8, STACK_SIZE_PER_HART
-        csrr	a0, CSR_MHARTID
 
         la	tp, __stack_bottom
         add	tp, tp, 63
@@ -99,6 +103,7 @@ _start:
 	la	a1, decompress_done_flag
 	REG_L	a0, 0(a1)
 	beqz	a0, .wait_for_decompress_done
+	fence	r, rw
         j	.decompress_done
 
 .e51_decompress:
@@ -238,6 +243,7 @@ _start:
 #endif
 
 
+	fence	rw, rw
 	li	a0, 1
 	la	a1, decompress_done_flag
 	REG_S	a0, 0(a1)
