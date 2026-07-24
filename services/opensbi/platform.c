@@ -32,6 +32,7 @@
 
 #include "config.h"
 #include "hss_types.h"
+#include "mss_pll.h"
 
 #include <assert.h>
 
@@ -69,7 +70,9 @@
 #include "reboot_service.h"
 #include "hss_boot_service.h"
 #include "clocks/hw_mss_clks.h"    // LIBERO_SETTING_MSS_RTC_TOGGLE_CLK
+#include "memory_map/hw_apb_split.h"
 #include "hss_clock.h"
+#include "mss_sysreg.h"
 
 #define MPFS_HART_COUNT            5
 #define MPFS_HART_STACK_SIZE       8192
@@ -86,6 +89,47 @@
 
 #define MPFS_ACLINT_MTIMER_FREQ    LIBERO_SETTING_MSS_RTC_TOGGLE_CLK
 #define MPFS_ACLINT_MTIMER_ADDR    (0x02004000)
+
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_CLOCK_SCALING)
+#define MPFS_MMUART0_LO_BASE       0x20000000UL
+#define MPFS_MMUART0_HI_BASE       0x28000000UL
+#if (LIBERO_SETTING_APBBUS_CR & 0x1UL)
+#  define MPFS_MMUART0_BASE        MPFS_MMUART0_HI_BASE
+#else
+#  define MPFS_MMUART0_BASE        MPFS_MMUART0_LO_BASE
+#endif
+
+#define MPFS_MMUART_DLR_OFFSET     0x00UL
+#define MPFS_MMUART_DMR_OFFSET     0x04UL
+#define MPFS_MMUART_LCR_OFFSET     0x0cUL
+#define MPFS_MMUART_LSR_OFFSET     0x14UL
+#define MPFS_MMUART_MM0_OFFSET     0x30UL
+#define MPFS_MMUART_DFR_OFFSET     0x3cUL
+
+#define MPFS_MMUART_LCR_DLAB       (1u << 7u)
+#define MPFS_MMUART_LSR_TEMT       (1u << 6u)
+#define MPFS_MMUART_MM0_EFBR       (1u << 7u)
+#define MPFS_MMUART_DFR_MASK       0x3fU
+
+#define MPFS_MMUART0_SUSPEND_CLOCK_DIVISOR 2UL
+
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_SCB_CLOCK_SWITCH)
+#define MPFS_SCB_CLOCK_HZ          80000000UL
+#define MPFS_IOSCB_PLL_MSS_PLL_CTRL ((volatile void *)0x3e001004UL)
+#define MPFS_IOSCB_MSS_MUX_MSSCLKMUX ((volatile void *)0x3e00200cUL)
+#define MPFS_MSSCLKMUX_SEL_MASK    0x3UL
+#define MPFS_MSS_PLL_CTRL_STATUS_MASK \
+    (PLL_CTRL_LOCK_BIT | (1UL << 28U) | (1UL << 29U) | (1UL << 31U))
+#define MPFS_MSS_PLL_LOCK_TIMEOUT  1000000UL
+#define MPFS_CLOCK_MUX_SETTLE_LOOPS 100U
+#endif
+#endif
+
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+#define MPFS_DDR_LOW_POWER_OPTIONS 0x1fU
+/* MC_BASE2.CFG_DRAM_CLK_DISABLE_IN_SELF_REFRESH is at DDRC offset 0x4310. */
+#define MPFS_DDRC_CFG_DRAM_CLK_DISABLE_SR_OFFSET 0x4310U
+#endif
 
 /**
  * PolarFire SoC has 5 HARTs but HART ID 0 doesn't have S mode. enable only
@@ -130,7 +174,10 @@ static struct {
     int reset_reason;
     bool allow_cold_reboot;
     bool allow_warm_reboot;
-    bool has_stopped;   /* secondary hart has taken j _start; now in HSS SSMB loop, not OpenSBI WFI */
+    bool has_stopped;
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+    bool parked;
+#endif
 } hart_ledger[MAX_NUM_HARTS] = { { { 0, }, } };
 
 static size_t num_sbi_domains = 0u;
@@ -139,6 +186,201 @@ static size_t num_sbi_domains = 0u;
  * out in plic.c to allow external use; declare them here at file scope. */
 extern void plic_set_ie(const struct plic_data *plic, u32 cntxid, u32 word_index, u32 val);
 extern void plic_set_thresh(const struct plic_data *plic, u32 cntxid, u32 val);
+
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_CLOCK_SCALING)
+static uint8_t mpfs_mmuart0_read8(unsigned long offset)
+{
+    return *(volatile uint8_t *)(MPFS_MMUART0_BASE + offset);
+}
+
+static void mpfs_mmuart0_write8(unsigned long offset, uint8_t value)
+{
+    *(volatile uint8_t *)(MPFS_MMUART0_BASE + offset) = value;
+}
+
+static void mpfs_mmuart0_wait_tx_empty(void)
+{
+    while ((mpfs_mmuart0_read8(MPFS_MMUART_LSR_OFFSET) & MPFS_MMUART_LSR_TEMT) == 0u) {
+        ;
+    }
+}
+
+static struct {
+    uint8_t dfr;
+    uint8_t dlr;
+    uint8_t dmr;
+    uint8_t lcr;
+    uint8_t mm0;
+} saved_mmuart0_baudrate;
+
+static void mpfs_mmuart0_save_baudrate(void)
+{
+    saved_mmuart0_baudrate.lcr = mpfs_mmuart0_read8(MPFS_MMUART_LCR_OFFSET);
+    saved_mmuart0_baudrate.mm0 = mpfs_mmuart0_read8(MPFS_MMUART_MM0_OFFSET);
+    saved_mmuart0_baudrate.dfr = mpfs_mmuart0_read8(MPFS_MMUART_DFR_OFFSET);
+
+    mpfs_mmuart0_write8(MPFS_MMUART_LCR_OFFSET,
+        saved_mmuart0_baudrate.lcr | MPFS_MMUART_LCR_DLAB);
+    saved_mmuart0_baudrate.dmr = mpfs_mmuart0_read8(MPFS_MMUART_DMR_OFFSET);
+    saved_mmuart0_baudrate.dlr = mpfs_mmuart0_read8(MPFS_MMUART_DLR_OFFSET);
+    mpfs_mmuart0_write8(MPFS_MMUART_LCR_OFFSET, saved_mmuart0_baudrate.lcr);
+}
+
+static void mpfs_mmuart0_restore_baudrate(void)
+{
+    uint8_t lcr = mpfs_mmuart0_read8(MPFS_MMUART_LCR_OFFSET);
+
+    mpfs_mmuart0_write8(MPFS_MMUART_LCR_OFFSET, lcr | MPFS_MMUART_LCR_DLAB);
+    mpfs_mmuart0_write8(MPFS_MMUART_DMR_OFFSET, saved_mmuart0_baudrate.dmr);
+    mpfs_mmuart0_write8(MPFS_MMUART_DLR_OFFSET, saved_mmuart0_baudrate.dlr);
+    mpfs_mmuart0_write8(MPFS_MMUART_LCR_OFFSET, saved_mmuart0_baudrate.lcr);
+
+    mpfs_mmuart0_write8(MPFS_MMUART_DFR_OFFSET, saved_mmuart0_baudrate.dfr);
+    mpfs_mmuart0_write8(MPFS_MMUART_MM0_OFFSET, saved_mmuart0_baudrate.mm0);
+}
+
+static void mpfs_mmuart0_scale_baudrate(uint64_t old_pclk_hz,
+    uint64_t new_pclk_hz)
+{
+    const uint32_t old_divisor =
+        ((uint32_t)saved_mmuart0_baudrate.dmr << 8u)
+        | saved_mmuart0_baudrate.dlr;
+    const uint8_t lcr = mpfs_mmuart0_read8(MPFS_MMUART_LCR_OFFSET);
+    uint64_t divisor_by_64;
+    uint64_t new_divisor_by_64;
+    uint32_t new_divisor;
+    uint32_t fractional_divisor;
+
+    if (old_pclk_hz == 0u || new_pclk_hz == 0u || old_divisor == 0u) {
+        return;
+    }
+
+    divisor_by_64 = (uint64_t)old_divisor * 64u;
+    if ((saved_mmuart0_baudrate.mm0 & MPFS_MMUART_MM0_EFBR) != 0u) {
+        divisor_by_64 += saved_mmuart0_baudrate.dfr
+            & MPFS_MMUART_DFR_MASK;
+    }
+
+    new_divisor_by_64 = (divisor_by_64 * new_pclk_hz
+        + (old_pclk_hz / 2u)) / old_pclk_hz;
+    new_divisor = (uint32_t)(new_divisor_by_64 / 64u);
+    fractional_divisor = (uint32_t)(new_divisor_by_64 % 64u);
+
+    if (new_divisor == 0u || new_divisor > 0xffffu) {
+        return;
+    }
+
+    mpfs_mmuart0_write8(MPFS_MMUART_LCR_OFFSET, lcr | MPFS_MMUART_LCR_DLAB);
+    mpfs_mmuart0_write8(MPFS_MMUART_DMR_OFFSET,
+        (uint8_t)(new_divisor >> 8u));
+    mpfs_mmuart0_write8(MPFS_MMUART_DLR_OFFSET, (uint8_t)new_divisor);
+    mpfs_mmuart0_write8(MPFS_MMUART_LCR_OFFSET, lcr);
+
+    if (new_divisor > 1u) {
+        mpfs_mmuart0_write8(MPFS_MMUART_MM0_OFFSET,
+            mpfs_mmuart0_read8(MPFS_MMUART_MM0_OFFSET) | MPFS_MMUART_MM0_EFBR);
+        mpfs_mmuart0_write8(MPFS_MMUART_DFR_OFFSET,
+            (uint8_t)fractional_divisor);
+    } else {
+        mpfs_mmuart0_write8(MPFS_MMUART_MM0_OFFSET,
+            mpfs_mmuart0_read8(MPFS_MMUART_MM0_OFFSET) & (uint8_t)~MPFS_MMUART_MM0_EFBR);
+    }
+}
+
+#if !IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_SCB_CLOCK_SWITCH)
+static void mpfs_mmuart0_set_suspend_baudrate(void)
+{
+    mpfs_mmuart0_scale_baudrate(LIBERO_SETTING_MSS_APB_AHB_CLK,
+        LIBERO_SETTING_MSS_APB_AHB_CLK / MPFS_MMUART0_SUSPEND_CLOCK_DIVISOR);
+}
+#endif
+
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_SCB_CLOCK_SWITCH)
+static uint32_t saved_mssclkmux;
+static uint32_t saved_mss_pll_ctrl;
+static bool scb_clock_state_saved = false;
+
+static void mpfs_clock_mux_settle(void)
+{
+    volatile uint32_t delay;
+
+    for (delay = 0u; delay < MPFS_CLOCK_MUX_SETTLE_LOOPS; delay++) {
+        ;
+    }
+}
+
+static void mpfs_mmuart0_set_scb_baudrate(void)
+{
+    mpfs_mmuart0_scale_baudrate(LIBERO_SETTING_MSS_APB_AHB_CLK,
+        MPFS_SCB_CLOCK_HZ / 8UL);
+}
+
+static uint32_t mpfs_mss_pll_ctrl_for_write(uint32_t pll_ctrl)
+{
+    return pll_ctrl & ~MPFS_MSS_PLL_CTRL_STATUS_MASK;
+}
+
+static void mpfs_suspend_scb_clock(void)
+{
+    if (scb_clock_state_saved) {
+        return;
+    }
+
+    saved_mssclkmux = readl(MPFS_IOSCB_MSS_MUX_MSSCLKMUX);
+    saved_mss_pll_ctrl = readl(MPFS_IOSCB_PLL_MSS_PLL_CTRL);
+    scb_clock_state_saved = true;
+
+    mss_freq_scaling(MSS_CLK_SCALING_LOW);
+    writel(saved_mssclkmux & ~MPFS_MSSCLKMUX_SEL_MASK,
+        MPFS_IOSCB_MSS_MUX_MSSCLKMUX);
+    mb();
+    mpfs_clock_mux_settle();
+
+    writel(mpfs_mss_pll_ctrl_for_write(saved_mss_pll_ctrl &
+        ~PLL_CTRL_REG_DIVQ0_EN_MASK), MPFS_IOSCB_PLL_MSS_PLL_CTRL);
+    mb();
+}
+
+static bool mpfs_mss_pll_is_locked(void)
+{
+    uint32_t timeout;
+
+    for (timeout = 0u; timeout < MPFS_MSS_PLL_LOCK_TIMEOUT; timeout++) {
+        if ((readl(MPFS_IOSCB_PLL_MSS_PLL_CTRL) &
+            PLL_CTRL_LOCK_BIT) != 0u) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void mpfs_resume_scb_clock(void)
+{
+    if (!scb_clock_state_saved) {
+        return;
+    }
+
+    writel(mpfs_mss_pll_ctrl_for_write(saved_mss_pll_ctrl),
+        MPFS_IOSCB_PLL_MSS_PLL_CTRL);
+    mb();
+    if (!mpfs_mss_pll_is_locked()) {
+        mHSS_DEBUG_PRINTF(LOG_ERROR, "MSS PLL failed to lock\n");
+        assert(0);
+        while (1) {
+            wfi();
+        }
+    }
+
+    writel(saved_mssclkmux, MPFS_IOSCB_MSS_MUX_MSSCLKMUX);
+    mb();
+    mpfs_clock_mux_settle();
+    mss_freq_scaling(MSS_CLK_SCALING_NORMAL);
+
+    scb_clock_state_saved = false;
+}
+#endif
+#endif
 
 static void mpfs_modify_dt(void *fdt)
 {
@@ -431,7 +673,10 @@ void mpfs_domains_register_hart(int hartid, int boot_hartid)
 
     hart_ledger[hartid].reset_reason = 0;
     hart_ledger[hartid].reset_type = 0;
-    hart_ledger[hartid].has_stopped = false;
+    __atomic_store_n(&hart_ledger[hartid].has_stopped, false, __ATOMIC_RELAXED);
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+    __atomic_store_n(&hart_ledger[hartid].parked, false, __ATOMIC_RELAXED);
+#endif
 }
 
 void mpfs_domains_deregister_hart(int hartid)
@@ -564,14 +809,21 @@ static int mpfs_hart_start(u32 hartid, ulong saddr)
 {
     (void)saddr;
 
-    if (hart_ledger[hartid].owner_hartid != hartid && hart_ledger[hartid].has_stopped) {
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+    __atomic_store_n(&hart_ledger[hartid].parked, false, __ATOMIC_RELEASE);
+#endif
+
+    if (hart_ledger[hartid].owner_hartid != hartid &&
+            __atomic_load_n(&hart_ledger[hartid].has_stopped,
+                __ATOMIC_ACQUIRE)) {
         /*
          * Secondary hart took j _start on a previous HART_STOP and is now
          * sitting in HSS's IPI loop.  Ask E51 to send IPI_MSG_GOTO to it.
          * We advance HSM state START_PENDING -> STARTED here because the hart
          * will not go through OpenSBI init_warm_startup() path.
          */
-        hart_ledger[hartid].has_stopped = false;
+        __atomic_store_n(&hart_ledger[hartid].has_stopped, false,
+            __ATOMIC_RELEASE);
         struct sbi_scratch *rscratch = sbi_hartid_to_scratch(hartid);
         sbi_hsm_prepare_next_jump(rscratch, hartid);
 
@@ -651,19 +903,23 @@ static int mpfs_hart_stop(void)
          * part of a system reboot (E51 will send IPI_MSG_GOTO to the
          * payload) or after system suspend resume (mpfs_hart_start() will
          * ask E51 to send IPI_MSG_GOTO with the Linux resume address).
-          *
+         *
          * Using j _start here instead of jump_warmboot() is necessary
          * because E51 communicates via SSMB, not via raw software IPIs,
          * so the hart must be in HSS IPI processing loop to receive it.
          */
-        hart_ledger[hartid].has_stopped = true;
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+        __atomic_store_n(&hart_ledger[hartid].parked, false, __ATOMIC_RELEASE);
+#endif
+        __atomic_store_n(&hart_ledger[hartid].has_stopped, true,
+            __ATOMIC_RELEASE);
         asm("j _start");
         __builtin_unreachable();
     }
 
     /*
      * Boot hart, plain SBI_EXT_HSM_HART_STOP (parked by Linux):
-     * use the * warmboot path so it blocks in sbi_hsm_hart_wait().
+     * use the warmboot path so it blocks in sbi_hsm_hart_wait().
      * mpfs_hart_start() wakes it with sbi_ipi_raw_send().
      */
     jump_warmboot();
@@ -678,32 +934,135 @@ bool mpfs_is_first_boot(void)
     return (atomic_xchg(&coldboot_lottery, 1) == 0);
 }
 
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+void mpfs_mark_hart_parked(void);
+void mpfs_mark_hart_parked(void)
+{
+    const u32 hartid = current_hartid();
+
+    if (hartid == HSS_HART_E51 || hartid >= ARRAY_SIZE(hart_ledger)) {
+        return;
+    }
+
+    __atomic_store_n(&hart_ledger[hartid].parked, true, __ATOMIC_RELEASE);
+}
+
+bool mpfs_is_hart_parked(u32 hartid)
+{
+    assert(hartid < ARRAY_SIZE(hart_ledger));
+
+    return __atomic_load_n(&hart_ledger[hartid].parked, __ATOMIC_ACQUIRE);
+}
+#endif
+
 static uint32_t suspended_hartid = 0u;
 
 void mpfs_set_suspended_hartid(uint32_t hartid)
 {
-    suspended_hartid = hartid;
+    __atomic_store_n(&suspended_hartid, hartid, __ATOMIC_RELEASE);
 }
 
 u32 mpfs_get_suspended_hartid(void)
 {
-    return suspended_hartid;
+    return __atomic_load_n(&suspended_hartid, __ATOMIC_ACQUIRE);
 }
 
 extern void mpfs_hal_turn_ddr_selfrefresh_on(void);
 extern void mpfs_hal_turn_ddr_selfrefresh_off(void);
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+extern void mpfs_hal_ddr_logic_power_state(uint32_t, uint32_t);
+extern void flush_l2_cache(uint32_t);
+#endif
+
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+static uint32_t mpfs_ddr_sr_read32(uint32_t offset)
+{
+    return *(volatile uint32_t *)((uintptr_t)MSS_DDRC_BASE_ADDR + offset);
+}
+
+static void mpfs_ddr_sr_write32(uint32_t offset, uint32_t value)
+{
+    *(volatile uint32_t *)((uintptr_t)MSS_DDRC_BASE_ADDR + offset) = value;
+}
+
+static uint32_t saved_ddr_dram_clk_disable_sr;
+
+static void mpfs_ddr_enable_clk_disable_in_sr(void)
+{
+    saved_ddr_dram_clk_disable_sr =
+        mpfs_ddr_sr_read32(MPFS_DDRC_CFG_DRAM_CLK_DISABLE_SR_OFFSET);
+    mpfs_ddr_sr_write32(MPFS_DDRC_CFG_DRAM_CLK_DISABLE_SR_OFFSET, 1U);
+    mb();
+}
+
+static void mpfs_ddr_restore_clk_disable_in_sr(void)
+{
+    mpfs_ddr_sr_write32(MPFS_DDRC_CFG_DRAM_CLK_DISABLE_SR_OFFSET,
+        saved_ddr_dram_clk_disable_sr);
+    mb();
+}
+
+static uint32_t saved_ddrc_clock_cr;
+static bool ddrc_clock_cr_saved = false;
+
+static void mpfs_suspend_ddrc_clock(void)
+{
+    if (ddrc_clock_cr_saved) {
+        return;
+    }
+
+    saved_ddrc_clock_cr = SYSREG->SUBBLK_CLOCK_CR;
+    ddrc_clock_cr_saved = true;
+
+    SYSREG->SUBBLK_CLOCK_CR =
+        saved_ddrc_clock_cr & ~SUBBLK_CLOCK_CR_DDRC_MASK;
+    mb();
+}
+
+static void mpfs_resume_ddrc_clock(void)
+{
+    if (!ddrc_clock_cr_saved) {
+        return;
+    }
+
+    SYSREG->SUBBLK_CLOCK_CR = saved_ddrc_clock_cr;
+    mb();
+
+    ddrc_clock_cr_saved = false;
+}
+#endif
 
 void mpfs_system_suspend(void)
 {
     if (!IS_ENABLED(CONFIG_SKIP_DDR)) {
         volatile uint32_t * const self_refresh_status_reg =
             (volatile uint32_t *)(MSS_DDRC_BASE_ADDR + MSS_DDRC_SELF_REFRESH_STATUS_OFFSET);
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+        flush_l2_cache((uint32_t)1U);
+        mpfs_ddr_enable_clk_disable_in_sr();
+#endif
+
         mpfs_hal_turn_ddr_selfrefresh_on();
         while ((*self_refresh_status_reg & MSS_DDRC_SELF_REFRESH_ACK_BIT) == 0u) {
             ; // poll INIT_SELF_REFRESH_STATUS bit until DDRC ACKs entry
         }
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+        mpfs_hal_ddr_logic_power_state(0, MPFS_DDR_LOW_POWER_OPTIONS);
+        mpfs_suspend_ddrc_clock();
+#endif
         mHSS_DEBUG_PRINTF(LOG_WARN, "%s: self_refresh active\n", __func__);
     }
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_CLOCK_SCALING)
+    mpfs_mmuart0_wait_tx_empty();
+    mpfs_mmuart0_save_baudrate();
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_SCB_CLOCK_SWITCH)
+    mpfs_suspend_scb_clock();
+    mpfs_mmuart0_set_scb_baudrate();
+#else
+    mss_freq_scaling(MSS_CLK_SCALING_LOW);
+    mpfs_mmuart0_set_suspend_baudrate();
+#endif
+#endif
 }
 
 void mpfs_system_resume(void)
@@ -711,13 +1070,29 @@ void mpfs_system_resume(void)
     if (!IS_ENABLED(CONFIG_SKIP_DDR)) {
         volatile uint32_t * const self_refresh_status_reg =
             (volatile uint32_t *)(MSS_DDRC_BASE_ADDR + MSS_DDRC_SELF_REFRESH_STATUS_OFFSET);
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+        mpfs_resume_ddrc_clock();
+        mpfs_hal_ddr_logic_power_state(1, MPFS_DDR_LOW_POWER_OPTIONS);
+#endif
         mpfs_hal_turn_ddr_selfrefresh_off();
         while ((*self_refresh_status_reg & MSS_DDRC_SELF_REFRESH_ACK_BIT) != 0u) {
             ;
         }
-
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+        mpfs_ddr_restore_clk_disable_in_sr();
+        flush_l2_cache((uint32_t)1U);
+#endif
         mHSS_DEBUG_PRINTF(LOG_WARN, "%s: self_refresh inactive\n", __func__);
     }
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_CLOCK_SCALING)
+    mpfs_mmuart0_wait_tx_empty();
+#if IS_ENABLED(CONFIG_SERVICE_OPENSBI_SUSPEND_SCB_CLOCK_SWITCH)
+    mpfs_resume_scb_clock();
+#else
+    mss_freq_scaling(MSS_CLK_SCALING_NORMAL);
+#endif
+    mpfs_mmuart0_restore_baudrate();
+#endif
 }
 
 const struct sbi_hsm_device mpfs_hsm = {

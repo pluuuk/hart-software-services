@@ -115,6 +115,11 @@ _start:
         jal	HSS_IHCInit_U54
 #endif
 
+#if defined(CONFIG_OPENSBI) && \
+	defined(CONFIG_SERVICE_OPENSBI_SUSPEND_DDR_POWER_SAVE)
+        jal     mpfs_mark_hart_parked
+#endif
+
 .spin_forever:
         wfi
         j	.spin_forever
