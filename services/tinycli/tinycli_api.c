@@ -155,6 +155,7 @@ static void tinyCLI_MMC_(void);
 static void tinyCLI_SDCARD_(void);
 static void tinyCLI_Payload_(void);
 static void tinyCLI_SPI_(void);
+static void tinyCLI_SNVM_(void);
 static void tinyCLI_Resume_(void);
 #if IS_ENABLED(CONFIG_SERVICE_USBDMSC) && (IS_ENABLED(CONFIG_SERVICE_MMC) || IS_ENABLED(CONFIG_SERVICE_QSPI))
 static void tinyCLI_USBDMSC_(void);
@@ -197,6 +198,7 @@ enum CmdId {
     CMD_RESUME,
     CMD_SCRUB,
     CMD_ECC,
+    CMD_SNVM,
     CMD_INVALID,
 
     CMD_DBG_BEU,
@@ -302,6 +304,7 @@ static const struct tinycli_cmd toplevelCmds[] = {
     { CMD_SDCARD,  "SDCARD",  "Select boot via SDCARD.", tinyCLI_SDCARD_ },
     { CMD_PAYLOAD, "PAYLOAD", "Select boot via payload.", tinyCLI_Payload_ },
     { CMD_SPI,     "SPI",     "Select boot via SPI.", tinyCLI_SPI_ },
+    { CMD_SNVM,    "SNVM",    "Select boot via sNVM.", tinyCLI_SNVM_ },
 #if IS_ENABLED(CONFIG_SERVICE_USBDMSC) && (IS_ENABLED(CONFIG_SERVICE_MMC) || IS_ENABLED(CONFIG_SERVICE_QSPI))
     { CMD_USBDMSC, "USBDMSC", "Export eMMC as USBD Mass Storage Class.", tinyCLI_USBDMSC_ },
 #endif
@@ -335,6 +338,7 @@ static struct tinycli_toplevel_cmd_safe toplevelCmdsSafeAfterBootFlags[] = {
     { CMD_SDCARD,  true },
     { CMD_PAYLOAD, true },
     { CMD_SPI,     true },
+    { CMD_SNVM,    true },
 #if IS_ENABLED(CONFIG_SERVICE_USBDMSC) && (IS_ENABLED(CONFIG_SERVICE_MMC) || IS_ENABLED(CONFIG_SERVICE_QSPI))
     { CMD_USBDMSC, true },
 #endif
@@ -941,6 +945,15 @@ static void tinyCLI_SPI_(void)
     HSS_BootSelectSPI();
 #else
     tinyCLI_UnsupportedBootMechanism_("SPI");
+#endif
+}
+
+static void tinyCLI_SNVM_(void)
+{
+#if IS_ENABLED(CONFIG_SERVICE_BOOT_SNVM)
+    HSS_BootSelectSNVM();
+#else
+    tinyCLI_UnsupportedBootMechanism_("SNVM");
 #endif
 }
 
