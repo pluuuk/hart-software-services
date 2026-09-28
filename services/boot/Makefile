@@ -34,8 +34,12 @@ SRCS-$(CONFIG_SERVICE_BOOT) += \
 SRCS-$(CONFIG_CRYPTO_SIGNING) += \
 	services/boot/hss_boot_secure.c \
 
+SRCS-$(CONFIG_SERVICE_BOOT_QSPI_REDUNDANT) += \
+	services/boot/hss_boot_rsimage.c \
+
 INCLUDES +=\
 	-I./services/boot \
 
 $(BINDIR)/services/boot/hss_boot_service.o: CFLAGS=$(CFLAGS_GCCEXT)
 $(BINDIR)/services/boot/hss_boot_pmp.o: CFLAGS=$(CFLAGS_GCCEXT)
+$(BINDIR)/services/boot/hss_boot_rsimage.o: CFLAGS=$(CFLAGS_GCCEXT)

@@ -45,6 +45,10 @@
 #  include "qspi_service.h"
 #endif
 
+#if IS_ENABLED(CONFIG_SERVICE_BOOT_QSPI_REDUNDANT)
+#  include "hss_boot_rsimage.h"
+#endif
+
 #if IS_ENABLED(CONFIG_SERVICE_MMC)
 #  include "mmc_service.h"
 #  include "gpt.h"
@@ -87,7 +91,7 @@ static bool copyBootImageToDDR_(struct HSS_BootImage *pBootImage, char *pDest,
 #endif
 #endif
 
-static bool getBootImageFromQSPI_(struct HSS_Storage *pStorage, struct HSS_BootImage **ppBootImage);
+static bool getBootImageFromQSPI_(struct HSS_Storage *pStorage, struct HSS_BootImage **ppBootImage) __attribute__((unused));
 static bool getBootImageFromMMC_(struct HSS_Storage *pStorage, struct HSS_BootImage **ppBootImage);
 static bool getBootImageFromSpiFlash_(struct HSS_Storage *pStorage, struct HSS_BootImage **ppBootImage);
 static bool getBootImageFromPayload_(struct HSS_Storage *pStorage, struct HSS_BootImage **ppBootImage);
@@ -100,7 +104,13 @@ static bool getBootImageFromSNVM_(struct HSS_Storage *pStorage, struct HSS_BootI
 #if IS_ENABLED(CONFIG_SERVICE_QSPI)
 static struct HSS_Storage qspiStorage_ = {
     .name = "QSPI",
+#if IS_ENABLED(CONFIG_SERVICE_BOOT_QSPI_REDUNDANT)
+    /* alternative, redundant striped QSPI layout */
+    .getBootImage = HSS_Boot_GetRedundantImage,
+#else
+    /* original fixed-offset QSPI boot image */
     .getBootImage = getBootImageFromQSPI_,
+#endif
     .init = HSS_CachedQSPIInit,
     .readBlock = HSS_CachedQSPI_ReadBlock,
     .writeBlock = HSS_CachedQSPI_WriteBlock,

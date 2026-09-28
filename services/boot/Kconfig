@@ -53,6 +53,25 @@ config SERVICE_BOOT_DDR_TARGET_ADDR
 	help
                 This feature specifies a scratch address for EMMC/QSPI decompression
 
+config SERVICE_BOOT_QSPI_REDUNDANT
+	bool "Redundant striped QSPI boot image"
+	default n
+	depends on SERVICE_BOOT && SERVICE_QSPI
+	help
+		This feature enables an alternative QSPI boot flow that reads a
+		striped, redundant image layout instead of the original
+		fixed-offset (offset 0) boot image.  The flash holds three
+		images - the HSS uboot boot image, a Linux kernel Image and a
+		device tree blob - each stored as three redundant copies, for
+		nine strips in total.  The strips are interleaved by image
+		(uboot, kernel, dtb, uboot, kernel, dtb, ...) and their offsets
+		are scaled from the overall image size rather than being fixed.
+		Each image has its own CRC32, checked against every copy.
+
+		The original QSPI boot code is used when this option is off.
+
+		If you do not know what to do here, say N.
+
 config SERVICE_BOOT_MMC_USE_GPT
     bool "Use GPT with MMC"
     default SERVICE_BOOT && SERVICE_MMC && y
