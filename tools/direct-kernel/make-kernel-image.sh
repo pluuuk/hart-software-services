@@ -24,7 +24,7 @@ GEN="${GEN:-$HSS/tools/hss-payload-generator/hss-payload-generator}"
 
 KERNEL="${KERNEL:-$HOME/linux/arch/riscv/boot/Image}"
 DTB="${DTB:-$HOME/uboot/dts/dt.dtb}"
-BOOTARGS="${BOOTARGS:-console=ttyS1,115200 earlycon=uart8250,mmio,0x20100000 ignore_loglevel root=/dev/mmcblk0 rootwait rw}"
+BOOTARGS="${BOOTARGS:-console=ttyS1,115200 earlycon=uart8250,mmio32,0x20100000,115200 ignore_loglevel root=/dev/mmcblk0 rootwait rw}"
 OUT="${OUT:-$PWD/kernel-flash.img}"
 FLASH_SIZE="${FLASH_SIZE:-32M}"
 
