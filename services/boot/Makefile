@@ -34,7 +34,7 @@ SRCS-$(CONFIG_SERVICE_BOOT) += \
 SRCS-$(CONFIG_CRYPTO_SIGNING) += \
 	services/boot/hss_boot_secure.c \
 
-SRCS-$(CONFIG_SERVICE_BOOT_QSPI_REDUNDANT) += \
+SRCS-$(CONFIG_SERVICE_BOOT_REDUNDANT) += \
 	services/boot/hss_boot_rsimage.c \
 
 INCLUDES +=\

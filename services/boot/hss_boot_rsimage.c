@@ -8,12 +8,16 @@
  */
 
 /*!
- * \file  Redundant Striped QSPI Boot Image
- * \brief Optional 3-copy / 3-image striped QSPI boot scheme
+ * \file  Redundant Striped Boot Image
+ * \brief Optional 3-copy / 3-image striped redundant boot scheme
  *
- * See hss_boot_rsimage.h for the on-flash layout description.  This file is
- * only compiled when CONFIG_SERVICE_BOOT_QSPI_REDUNDANT is selected, so the
- * original fixed-offset QSPI boot flow continues to be used otherwise.
+ * See hss_boot_rsimage.h for the on-storage layout description.  This file is
+ * compiled when CONFIG_SERVICE_BOOT_REDUNDANT is selected.  It is completely
+ * storage independent: all reads go through the HSS_Storage readBlock
+ * operation, so the same reader works over QSPI, MMC, or any other backend
+ * that implements struct HSS_Storage.  Which backend uses it is chosen at
+ * compile time via CONFIG_SERVICE_BOOT_REDUNDANT_QSPI / _MMC (include
+ * selection).
  *
  * Every chunk has its own header and the chunk offsets come from the
  * precalculated HSS_RS_OFF_* constants, so there is no global header that
@@ -26,13 +30,13 @@
 #include "hss_crc32.h"
 #include "hss_boot_rsimage.h"
 #include "hss_boot_service.h"
+#include "hss_boot_pmp.h"
 #include "ddr_service.h"
-#include "qspi_service.h"
 
 #include <assert.h>
 #include <string.h>
 
-#if IS_ENABLED(CONFIG_SERVICE_BOOT_QSPI_REDUNDANT)
+#if IS_ENABLED(CONFIG_SERVICE_BOOT_REDUNDANT)
 
 /* Keep the on-flash layout in lock-step with tools/qspi-rs-image */
 _Static_assert(sizeof(struct HSS_RS_ChunkHeader) == 48, "HSS_RS_ChunkHeader size");
@@ -79,25 +83,89 @@ static const char *rsImageName_(uint32_t imageId)
  *
  * A corrupt header is not fatal: the caller simply tries the next copy.
  */
-static bool rsReadChunkHeader_(const struct HSS_RS_ChunkInfo * const pInfo,
+/*
+ * Storage-independent read helper.
+ *
+ * MMC requires a sector-aligned source offset (and a 4-byte aligned
+ * destination), but the chunk header sits at the chunk start while the payload
+ * follows *immediately* after it, so payload reads are not sector aligned.
+ * Read the leading partial block through a bounce buffer, then read the now
+ * aligned remainder straight into the destination.  QSPI does not require
+ * alignment but works fine through the same path.
+ */
+static uint32_t rsBlockSize_ = 1u;
+
+/* Bounce buffer for partial-block reads.  Must be static/global rather than on
+ * the stack: HSS_MMC_ReadBlock moves data with the PDMA engine, which cannot
+ * target the E51 stack. */
+static uint8_t rsBounce_[4096] __attribute__((aligned(8)));
+
+static bool rsRead_(struct HSS_Storage *pStorage, void *pDest,
+    size_t srcOffset, size_t byteCount)
+{
+    uint8_t *pDestU8 = (uint8_t *)pDest;
+    const uint32_t blockSize = rsBlockSize_ ? rsBlockSize_ : 1u;
+    uint8_t * const bounce = rsBounce_;
+
+    if (blockSize > sizeof(rsBounce_)) {
+        return false;
+    }
+
+    size_t off = srcOffset;
+    size_t remaining = byteCount;
+
+    while (remaining) {
+        const size_t blkOff = off % blockSize;
+        const size_t firstLen = (remaining < (blockSize - blkOff))
+            ? remaining : (blockSize - blkOff);
+
+        if ((blkOff == 0u) && (remaining >= blockSize)) {
+            /* whole aligned blocks: read straight into the destination */
+            const size_t fullLen = (remaining / blockSize) * blockSize;
+            if (!pStorage->readBlock(pDestU8, off, fullLen)) {
+                return false;
+            }
+            pDestU8 += fullLen;
+            off += fullLen;
+            remaining -= fullLen;
+        } else {
+            /* partial block (incl. reads smaller than one block, such as the
+             * 48-byte chunk header): read a whole block into bounce and copy
+             * out the wanted range.  HSS_MMC_ReadBlock does not cope with a
+             * sub-sector transfer on its own. */
+            if (!pStorage->readBlock(bounce, off - blkOff, blockSize)) {
+                return false;
+            }
+            memcpy(pDestU8, &bounce[blkOff], firstLen);
+            pDestU8 += firstLen;
+            off += firstLen;
+            remaining -= firstLen;
+        }
+    }
+
+    return true;
+}
+
+static bool rsReadChunkHeader_(struct HSS_Storage *pStorage,
+    const struct HSS_RS_ChunkInfo * const pInfo,
     uint32_t image, uint32_t copy, struct HSS_RS_ChunkHeader * const pHeader)
 {
-    if (!HSS_QSPI_ReadBlock(pHeader, pInfo->offset, sizeof(*pHeader))) {
-        mHSS_DEBUG_PRINTF(LOG_WARN, "QSPI-RS: %s copy %u header read failed\n",
+    if (!rsRead_(pStorage, pHeader, pInfo->offset, sizeof(*pHeader))) {
+        mHSS_DEBUG_PRINTF(LOG_WARN, "RS: %s copy %u header read failed\n",
             rsImageName_(image), copy);
         return false;
     }
 
     if (pHeader->magic != HSS_RS_CHUNK_MAGIC) {
         mHSS_DEBUG_PRINTF(LOG_WARN,
-            "QSPI-RS: %s copy %u bad chunk magic 0x%08x\n",
+            "RS: %s copy %u bad chunk magic 0x%08x\n",
             rsImageName_(image), copy, pHeader->magic);
         return false;
     }
 
     if (pHeader->version != HSS_RS_VERSION) {
         mHSS_DEBUG_PRINTF(LOG_WARN,
-            "QSPI-RS: %s copy %u unsupported chunk version %u\n",
+            "RS: %s copy %u unsupported chunk version %u\n",
             rsImageName_(image), copy, pHeader->version);
         return false;
     }
@@ -105,7 +173,7 @@ static bool rsReadChunkHeader_(const struct HSS_RS_ChunkInfo * const pInfo,
     if ((pHeader->imageId != image) || (pHeader->copyIndex != copy) ||
         (pHeader->flashOffset != pInfo->offset)) {
         mHSS_DEBUG_PRINTF(LOG_WARN,
-            "QSPI-RS: %s copy %u chunk header mismatch "
+            "RS: %s copy %u chunk header mismatch "
             "(id %u/%u, copy %u/%u, offset 0x%llx/0x%x)\n",
             rsImageName_(image), copy,
             pHeader->imageId, image, pHeader->copyIndex, copy,
@@ -113,10 +181,18 @@ static bool rsReadChunkHeader_(const struct HSS_RS_ChunkInfo * const pInfo,
         return false;
     }
 
+    if ((pHeader->ownerHart < HSS_HART_U54_1) ||
+        (pHeader->ownerHart >= HSS_HART_NUM_PEERS)) {
+        mHSS_DEBUG_PRINTF(LOG_WARN,
+            "RS: %s copy %u invalid owner hart %u\n",
+            rsImageName_(image), copy, pHeader->ownerHart);
+        return false;
+    }
+
     if (!pHeader->payloadSize ||
         (pHeader->payloadSize > (pInfo->capacity - sizeof(*pHeader)))) {
         mHSS_DEBUG_PRINTF(LOG_WARN,
-            "QSPI-RS: %s copy %u payload 0x%x does not fit capacity 0x%x\n",
+            "RS: %s copy %u payload 0x%x does not fit capacity 0x%x\n",
             rsImageName_(image), copy, pHeader->payloadSize, pInfo->capacity);
         return false;
     }
@@ -129,7 +205,7 @@ static bool rsReadChunkHeader_(const struct HSS_RS_ChunkInfo * const pInfo,
 
     if (headerCrc != pHeader->headerCrc) {
         mHSS_DEBUG_PRINTF(LOG_WARN,
-            "QSPI-RS: %s copy %u chunk header CRC mismatch "
+            "RS: %s copy %u chunk header CRC mismatch "
             "(calculated 0x%08x vs expected 0x%08x)\n",
             rsImageName_(image), copy, headerCrc, pHeader->headerCrc);
         return false;
@@ -141,7 +217,7 @@ static bool rsReadChunkHeader_(const struct HSS_RS_ChunkInfo * const pInfo,
 /*!
  * \brief Stage one image, verifying its header and payload CRC per copy
  */
-static bool rsStageImage_(uint32_t image)
+static bool rsStageImage_(struct HSS_Storage *pStorage, uint32_t image)
 {
     bool found = false;
 
@@ -149,7 +225,7 @@ static bool rsStageImage_(uint32_t image)
         const struct HSS_RS_ChunkInfo * const pInfo = &HSS_RS_layout[image][copy];
         struct HSS_RS_ChunkHeader header;
 
-        if (!rsReadChunkHeader_(pInfo, image, copy, &header)) {
+        if (!rsReadChunkHeader_(pStorage, pInfo, image, copy, &header)) {
             continue;
         }
 
@@ -158,21 +234,24 @@ static bool rsStageImage_(uint32_t image)
             : (uintptr_t)header.execAddr;
 
         if (!HSS_DDR_IsAddrInDDR(dest) ||
-            !HSS_DDR_IsAddrInDDR(dest + header.payloadSize)) {
+            !HSS_DDR_IsAddrInDDR(dest + header.payloadSize) ||
+            !HSS_PMP_CheckWrite((enum HSSHartId)header.ownerHart,
+                (ptrdiff_t)dest, header.payloadSize)) {
             mHSS_DEBUG_PRINTF(LOG_ERROR,
-                "QSPI-RS: %s copy %u has an invalid DDR destination 0x%lx\n",
-                rsImageName_(image), copy, (unsigned long)dest);
+                "RS: %s copy %u destination 0x%lx/%u not writable by u54_%u\n",
+                rsImageName_(image), copy, (unsigned long)dest,
+                header.payloadSize, header.ownerHart);
             continue;
         }
 
         mHSS_DEBUG_PRINTF(LOG_NORMAL,
-            "QSPI-RS: %s copy %u @ 0x%x (%u bytes) -> 0x%lx\n",
+            "RS: %s copy %u @ 0x%x (%u bytes) -> 0x%lx\n",
             rsImageName_(image), copy, pInfo->offset,
             header.payloadSize, (unsigned long)dest);
 
-        if (!HSS_QSPI_ReadBlock((void *)dest,
+        if (!rsRead_(pStorage, (void *)dest,
                 pInfo->offset + sizeof(header), header.payloadSize)) {
-            mHSS_DEBUG_PRINTF(LOG_WARN, "QSPI-RS: %s copy %u payload read failed\n",
+            mHSS_DEBUG_PRINTF(LOG_WARN, "RS: %s copy %u payload read failed\n",
                 rsImageName_(image), copy);
             continue;
         }
@@ -180,12 +259,12 @@ static bool rsStageImage_(uint32_t image)
         const uint32_t crc = CRC32_calculate((const uint8_t *)dest, header.payloadSize);
         if (crc == header.payloadCrc) {
             mHSS_DEBUG_PRINTF(LOG_NORMAL,
-                "QSPI-RS: %s copy %u CRC OK (0x%08x)\n",
+                "RS: %s copy %u CRC OK (0x%08x)\n",
                 rsImageName_(image), copy, crc);
             found = true;
         } else {
             mHSS_DEBUG_PRINTF(LOG_WARN,
-                "QSPI-RS: %s copy %u CRC mismatch "
+                "RS: %s copy %u CRC mismatch "
                 "(calculated 0x%08x vs expected 0x%08x)\n",
                 rsImageName_(image), copy, crc, header.payloadCrc);
         }
@@ -193,7 +272,7 @@ static bool rsStageImage_(uint32_t image)
 
     if (!found) {
         mHSS_DEBUG_PRINTF(LOG_ERROR,
-            "QSPI-RS: all %u copies of \"%s\" failed\n",
+            "RS: all %u copies of \"%s\" failed\n",
             HSS_RS_NUM_COPIES, rsImageName_(image));
     }
 
@@ -208,32 +287,40 @@ bool HSS_Boot_GetRedundantImage(struct HSS_Storage *pStorage,
 
     uint32_t pageSize = 0u, eraseSize = 0u, pageCount = 0u;
 
+    if (!pStorage->readBlock) {
+        mHSS_DEBUG_PRINTF(LOG_ERROR,
+            "RS: storage \"%s\" has no readBlock operation\n", pStorage->name);
+        return false;
+    }
+
     if (pStorage->getInfo) {
         pStorage->getInfo(&pageSize, &eraseSize, &pageCount);
     }
+    rsBlockSize_ = pageSize ? pageSize : 1u;
 
-    /* the precalculated layout must fit the actual flash */
+    /* the precalculated layout must fit the actual storage */
     if (eraseSize && pageCount) {
-        const uint64_t flashBytes = (uint64_t)eraseSize * pageCount;
+        const uint64_t storageBytes = (uint64_t)eraseSize * pageCount;
         const uint64_t usedBytes = (uint64_t)HSS_RS_OFF_DTB_2 + HSS_RS_CHUNK_DTB_SIZE;
 
-        if (usedBytes > flashBytes) {
+        if (usedBytes > storageBytes) {
             mHSS_DEBUG_PRINTF(LOG_ERROR,
-                "QSPI-RS: layout needs 0x%llx bytes but flash is 0x%llx bytes\n",
-                (unsigned long long)usedBytes, (unsigned long long)flashBytes);
+                "RS: layout needs 0x%llx bytes but storage is 0x%llx bytes\n",
+                (unsigned long long)usedBytes, (unsigned long long)storageBytes);
             return false;
         }
     }
 
     mHSS_DEBUG_PRINTF(LOG_NORMAL,
-        "QSPI-RS: %u images x %u copies, constant layout, "
+        "RS: storage %s, %u images x %u copies, constant layout, "
         "copy stride 0x%x, first chunk at 0x%x\n",
+        pStorage->name,
         HSS_RS_NUM_IMAGES, HSS_RS_NUM_COPIES,
         HSS_RS_COPY_STRIDE, HSS_RS_BOOT_BLOCK);
 
     /* verify each image's chunk/payload CRC across its copies and stage it */
     for (uint32_t image = 0u; image < HSS_RS_NUM_IMAGES; image++) {
-        if (!rsStageImage_(image)) {
+        if (!rsStageImage_(pStorage, image)) {
             return false;
         }
     }
@@ -243,15 +330,15 @@ bool HSS_Boot_GetRedundantImage(struct HSS_Storage *pStorage,
         (struct HSS_BootImage *)(uintptr_t)CONFIG_SERVICE_BOOT_DDR_TARGET_ADDR;
 
     if (!HSS_Boot_VerifyMagic(pBootImage)) {
-        mHSS_DEBUG_PRINTF(LOG_ERROR, "QSPI-RS: staged uboot image failed magic check\n");
+        mHSS_DEBUG_PRINTF(LOG_ERROR, "RS: staged uboot image failed magic check\n");
         return false;
     }
 
-    mHSS_DEBUG_PRINTF(LOG_NORMAL, "QSPI-RS: staged uboot boot image at 0x%p\n",
+    mHSS_DEBUG_PRINTF(LOG_NORMAL, "RS: staged uboot boot image at 0x%p\n",
         pBootImage);
     *ppBootImage = pBootImage;
 
     return true;
 }
 
-#endif /* CONFIG_SERVICE_BOOT_QSPI_REDUNDANT */
+#endif /* CONFIG_SERVICE_BOOT_REDUNDANT */

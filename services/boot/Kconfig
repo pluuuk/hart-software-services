@@ -53,24 +53,53 @@ config SERVICE_BOOT_DDR_TARGET_ADDR
 	help
                 This feature specifies a scratch address for EMMC/QSPI decompression
 
-config SERVICE_BOOT_QSPI_REDUNDANT
-	bool "Redundant striped QSPI boot image"
+config SERVICE_BOOT_REDUNDANT
+	bool "Redundant striped boot image (storage independent)"
 	default n
-	depends on SERVICE_BOOT && SERVICE_QSPI
+	depends on SERVICE_BOOT
 	help
-		This feature enables an alternative QSPI boot flow that reads a
-		striped, redundant image layout instead of the original
-		fixed-offset (offset 0) boot image.  The flash holds three
-		images - the HSS uboot boot image, a Linux kernel Image and a
-		device tree blob - each stored as three redundant copies, for
-		nine strips in total.  The strips are interleaved by image
-		(uboot, kernel, dtb, uboot, kernel, dtb, ...) and their offsets
-		are scaled from the overall image size rather than being fixed.
-		Each image has its own CRC32, checked against every copy.
+		This feature enables a storage-independent redundant boot
+		image reader that replaces the normal single boot image
+		lookup.  Storage holds three images - the HSS uboot boot
+		image, a Linux kernel Image and a device tree blob - each
+		stored as three redundant copies, for nine striped chunks in
+		total.  The chunks are interleaved by image (uboot, kernel,
+		dtb, uboot, kernel, dtb, ...) and use precalculated constant
+		offsets (see services/boot/hss_boot_rsimage.h).
+		Every chunk carries its own header and CRC32, and all copies
+		of an image are checked, falling back to the next copy on a
+		mismatch.
 
-		The original QSPI boot code is used when this option is off.
+		The regular per-storage boot code is used when this option is
+		off.
 
 		If you do not know what to do here, say N.
+
+choice
+	prompt "Storage for the redundant striped boot image"
+	depends on SERVICE_BOOT_REDUNDANT
+	default SERVICE_BOOT_REDUNDANT_QSPI
+	help
+		Compile-time (include) selection of which storage backend
+		uses the redundant striped layout instead of its normal boot
+		image lookup.  The chunk layout is identical for every
+		storage; only the backend that performs the reads differs.
+
+config SERVICE_BOOT_REDUNDANT_QSPI
+	bool "QSPI"
+	depends on SERVICE_QSPI
+	help
+		Apply the redundant striped layout to the QSPI boot storage.
+
+config SERVICE_BOOT_REDUNDANT_MMC
+	bool "MMC (SD/eMMC)"
+	depends on SERVICE_MMC
+	help
+		Apply the redundant striped layout to the MMC boot storage.
+		The chunk offsets are byte offsets into the MMC device, so a
+		dedicated card/region is expected.
+
+endchoice
 
 config SERVICE_BOOT_MMC_USE_GPT
     bool "Use GPT with MMC"
