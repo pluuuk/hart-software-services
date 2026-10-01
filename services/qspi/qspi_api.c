@@ -194,8 +194,21 @@ static inline uint32_t logical_to_physical_block_(const uint32_t logical_block)
 
 static void demandCopyFlashBlocksToCache_(size_t byteOffset, size_t byteCount, bool markDirty)
 {
-    for (size_t offset = byteOffset; offset < (byteOffset + byteCount); offset += blockSize) {
-        const size_t physicalBlockOffset = logical_to_physical_block_(column_to_block_(offset));
+    if (!byteCount) {
+        return;
+    }
+
+    /*
+     * Iterate by *block index*, not by byte offset.  Stepping bytes from an
+     * unaligned byteOffset never reaches the block that contains the last byte
+     * of the range, so that block would be left unloaded (and the subsequent
+     * memcpy would serve stale DDR).
+     */
+    const size_t firstBlock = column_to_block_(byteOffset);
+    const size_t lastBlock = column_to_block_(byteOffset + byteCount - 1u);
+
+    for (size_t block = firstBlock; block <= lastBlock; block++) {
+        const size_t physicalBlockOffset = logical_to_physical_block_(block);
 
         if (!pLogicalBlockDesc[physicalBlockOffset].inCache) {
             //mHSS_DEBUG_PRINTF(LOG_NORMAL, "Reading block %u into cache\n", physicalBlockOffset);
@@ -255,37 +268,47 @@ static void copyCacheToFlashBlocks_(size_t byteOffset, size_t byteCount)
     const size_t initialDirtyBlockCount = dirtyBlockCount;
     uint8_t status = 0xFF;
 
-    for (size_t offset = byteOffset; dirtyBlockCount && (offset < endOffset); offset += blockSize) {
+    /*
+     * As in demandCopyFlashBlocksToCache_(), iterate block indices so the block
+     * holding the last byte of the range is not skipped.  Stepping byte offsets
+     * from an unaligned base would leave that dirty block unflushed.
+     */
+    if (byteOffset < endOffset) {
+        const size_t firstBlock = column_to_block_(byteOffset);
+        const size_t lastBlock = column_to_block_(endOffset - 1u);
 
-        HSS_ShowProgress(initialDirtyBlockCount, dirtyBlockCount);
+        for (size_t block = firstBlock; dirtyBlockCount && (block <= lastBlock); block++) {
+
+            HSS_ShowProgress(initialDirtyBlockCount, dirtyBlockCount);
 
 #if IS_ENABLED(CONFIG_SERVICE_WDOG)
-        HSS_Wdog_E51_Tickle();
+            HSS_Wdog_E51_Tickle();
 #endif
 
-        const size_t physicalBlockOffset = logical_to_physical_block_(column_to_block_(offset));
+            const size_t physicalBlockOffset = logical_to_physical_block_(block);
 
-        if (pLogicalBlockDesc[physicalBlockOffset].inCache) {
-            if (pLogicalBlockDesc[physicalBlockOffset].dirtyCache) {
-                const size_t physicalBlockByteOffset = physicalBlockOffset * blockSize;
+            if (pLogicalBlockDesc[physicalBlockOffset].inCache) {
+                if (pLogicalBlockDesc[physicalBlockOffset].dirtyCache) {
+                    const size_t physicalBlockByteOffset = physicalBlockOffset * blockSize;
 #if IS_ENABLED(CONFIG_SERVICE_QSPI_WINBOND_W25N01GV)
-                status = Flash_erase_block(physicalBlockOffset);
+                    status = Flash_erase_block(physicalBlockOffset);
 #else
-                status = flashEraseSector(physicalBlockOffset);
+                    status = flashEraseSector(physicalBlockOffset);
 #endif
-                if (status) {
-                    mHSS_DEBUG_PRINTF(LOG_ERROR, "Error erasing block %u\n", physicalBlockOffset);
-                    break;
+                    if (status) {
+                        mHSS_DEBUG_PRINTF(LOG_ERROR, "Error erasing block %u\n", physicalBlockOffset);
+                        break;
+                    }
+
+                    status = Flash_program(pCacheDataBuffer + physicalBlockByteOffset, physicalBlockByteOffset, blockSize);
+                    if (status) {
+                        mHSS_DEBUG_PRINTF(LOG_ERROR, "Error programming block %u\n", physicalBlockOffset);
+
+                    }
+
+                    pLogicalBlockDesc[physicalBlockOffset].dirtyCache = false;
+                    dirtyBlockCount--;
                 }
-
-                status = Flash_program(pCacheDataBuffer + physicalBlockByteOffset, physicalBlockByteOffset, blockSize);
-                if (status) {
-                    mHSS_DEBUG_PRINTF(LOG_ERROR, "Error programming block %u\n", physicalBlockOffset);
-
-                }
-
-                pLogicalBlockDesc[physicalBlockOffset].dirtyCache = false;
-                dirtyBlockCount--;
             }
         }
     }
