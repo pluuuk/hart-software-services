@@ -11,7 +11,9 @@
 .config.old
 config.h
 include/tool_versions.h
+services/boot/hss_boot_rsimage_layout.h
 services/opensbi/opensbi_ecall_exts.c
 compile_commands.json
+tools/hss-payload-generator/hss-payload-generator
 .cache/
 build/
