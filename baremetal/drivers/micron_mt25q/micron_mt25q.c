@@ -748,7 +748,7 @@ probe_io_format
     void
 )
 {
-    volatile uint8_t device_id __attribute__ ((aligned (4))) = 0x0u;
+    uint8_t device_id[4] __attribute__ ((aligned (4))) = {0u, 0u, 0u, 0u};
     mss_qspi_io_format io_format = MSS_QSPI_NORMAL;
 
     for(uint8_t idx = 0u; idx < 8u; idx++)
@@ -756,9 +756,10 @@ probe_io_format
         g_qspi_config.io_format = (MSS_QSPI_QUAD_FULL - idx);
         MSS_QSPI_configure(&g_qspi_config);
 
-        Flash_readid((uint8_t*)&device_id);
+        device_id[0] = 0u; device_id[1] = 0u; device_id[2] = 0u;
+        Flash_readid(device_id);
 
-        if (MICRON_JEDEC_ID == device_id)
+        if (MICRON_JEDEC_ID == device_id[0])
         {
             io_format = (MSS_QSPI_QUAD_FULL - idx);
             break;
