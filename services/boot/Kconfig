@@ -53,6 +53,17 @@ config SERVICE_BOOT_DDR_TARGET_ADDR
 	help
                 This feature specifies a scratch address for EMMC/QSPI decompression
 
+config SERVICE_BOOT_MAX_IMAGE_SIZE
+	hex "Maximum boot image size"
+	default 0x200000
+	depends on SERVICE_BOOT
+	help
+                Sanity limit on the size of a boot image read from storage.
+                The 2 MiB default is ample for a U-Boot payload, but a Linux
+                kernel Image booted directly (skipping U-Boot) is larger, so
+                raise this above the kernel plus device tree size to use the
+                direct kernel boot flow (tools/direct-kernel).
+
 config SERVICE_BOOT_MMC_USE_GPT
     bool "Use GPT with MMC"
     default SERVICE_BOOT && SERVICE_MMC && y
