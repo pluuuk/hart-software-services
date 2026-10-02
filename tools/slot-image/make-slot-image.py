@@ -46,6 +46,63 @@ def layout_end(layout):
     return layout["base"] + layout["copies"] * stride(layout)
 
 
+def align_up(x, a=0x10000):
+    return (x + a - 1) & ~(a - 1)
+
+
+def align_down(x, a=0x10000):
+    return x & ~(a - 1)
+
+
+def recommend(layout, blobs, max_payload, want_gap):
+    """Print a map sized from the payload and/or a wanted contiguous tolerance.
+
+    capacity is chosen so the largest payload fits (rounded up to the 64 KiB
+    erase unit) and so that gap = (N-1)*c covers the wanted tolerance; the map
+    is then checked against the part size.  Nothing is written.
+    """
+    n, m, base = layout["slots"], layout["copies"], layout["base"]
+    part = layout.get("part_size")
+
+    size = max_payload or (max(len(b) for b in blobs.values()) if blobs else 0)
+    if not size:
+        raise SystemExit("--recommend needs --max-payload, or --slot S:FILE")
+    if want_gap and n < 2:
+        raise SystemExit("--gap needs --slots >= 2")
+
+    c = align_up(HSS_SLOT_HDR_SIZE + size)
+    if want_gap:
+        c = max(c, align_up(-(-want_gap // (n - 1))))
+    new = dict(layout, capacity=c)
+    stride_ = n * c
+    gap = (n - 1) * c
+    end = layout_end(new)
+
+    print("payload       0x%08x" % size)
+    print("capacity c    0x%08x" % c)
+    print("slots N       %d" % n)
+    print("copies M      %d" % m)
+    print("stride N*c    0x%08x" % stride_)
+    print("gap (N-1)*c   0x%08x   contiguous damage survived" % gap)
+    print("layout end    0x%08x" % end)
+    if part:
+        print("part size     0x%08x" % part)
+        if end > part:
+            print("DOES NOT FIT")
+            print("  largest M with N=%d: %d" % (n, (part - base) // stride_))
+            print("  largest c with N=%d M=%d: 0x%x"
+                  % (n, m, align_down((part - base) // (m * n))))
+            return 1
+        print("free          0x%08x (%.1f%%)"
+              % (part - end, 100.0 * (part - end) / part))
+    for slot in range(n):
+        offs = " ".join("0x%08x" % region(new, slot, k) for k in range(m))
+        print("slot %c        %s" % (chr(ord('A') + slot), offs))
+    print("\nuse:  --base 0x%x --capacity 0x%x --slots %d --copies %d"
+          % (base, c, n, m))
+    return 0
+
+
 def build_header(layout, slot, copy, blob, owner_hart, content_version,
                  corrupt_header=False):
     off = region(layout, slot, copy)
@@ -182,6 +239,12 @@ def main(argv):
     p.add_argument("--slots", type=int)
     p.add_argument("--copies", type=int)
     p.add_argument("--part-size", type=lambda x: int(x, 0))
+    p.add_argument("--recommend", action="store_true",
+                   help="print a map sized from --max-payload / --gap; writes nothing")
+    p.add_argument("--max-payload", type=lambda x: int(x, 0),
+                   help="largest payload size in bytes (with --recommend)")
+    p.add_argument("--gap", type=lambda x: int(x, 0),
+                   help="contiguous damage tolerance in bytes (with --recommend)")
     p.add_argument("--slot", action="append", default=[], metavar="S:FILE",
                    help="blob for slot S (S is 0-based); repeatable")
     p.add_argument("--emit-header", metavar="PATH")
@@ -205,6 +268,9 @@ def main(argv):
         s, _, path = item.partition(":")
         with open(path, "rb") as f:
             blobs[int(s)] = f.read()
+
+    if args.recommend:
+        return recommend(layout, blobs, args.max_payload, args.gap)
 
     corrupt = parse_corrupt(args.corrupt)
     corrupt_hdr = set()

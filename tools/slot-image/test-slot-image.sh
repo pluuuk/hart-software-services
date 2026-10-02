@@ -22,6 +22,19 @@ python3 "$here/make-slot-image.py" --self-test
 echo "== self-test: qemu =="
 python3 "$here/make-slot-image.py" --self-test --qemu
 
+echo "== recommend: reproduce the production map =="
+python3 "$here/make-slot-image.py" --recommend --max-payload 0x380000 \
+    --gap 0x2200000 --part-size 0x10000000 | tee "$work/rec.txt"
+grep -q "capacity c    0x02200000" "$work/rec.txt"
+grep -q "layout end    0x0cc10000" "$work/rec.txt"
+grep -q "0x08810000" "$work/rec.txt"
+
+if python3 "$here/make-slot-image.py" --recommend --max-payload 0x4000000 \
+        --part-size 0x2000000 >/dev/null; then
+    echo "recommend: FAIL — oversized payload reported as fitting" >&2
+    exit 1
+fi
+
 echo "== emit header + image (qemu map) =="
 python3 "$here/make-slot-image.py" --qemu --slot 0:"$work/blob.bin" \
     --slot 1:"$work/blob.bin" \
