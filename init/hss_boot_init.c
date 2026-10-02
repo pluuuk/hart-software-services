@@ -72,6 +72,10 @@
 #include "hss_boot_pmp.h"
 #include "hss_atomic.h"
 
+#if IS_ENABLED(CONFIG_SERVICE_BOOT_REDUNDANT)
+#  include "hss_boot_slotimage.h"
+#endif
+
 #include "sbi_bitops.h"
 
 //
@@ -92,6 +96,12 @@ static bool getBootImageFromMMC_(struct HSS_Storage *pStorage, struct HSS_BootIm
 static bool getBootImageFromSpiFlash_(struct HSS_Storage *pStorage, struct HSS_BootImage **ppBootImage);
 static bool getBootImageFromPayload_(struct HSS_Storage *pStorage, struct HSS_BootImage **ppBootImage);
 static bool getBootImageFromSNVM_(struct HSS_Storage *pStorage, struct HSS_BootImage **ppBootImage);
+#if IS_ENABLED(CONFIG_SERVICE_BOOT_REDUNDANT_QSPI)
+static bool getBootImageFromRedundantQSPI_(struct HSS_Storage *pStorage, struct HSS_BootImage **ppBootImage);
+#endif
+#if IS_ENABLED(CONFIG_SERVICE_BOOT_REDUNDANT_MMC)
+static bool getBootImageFromRedundantMMC_(struct HSS_Storage *pStorage, struct HSS_BootImage **ppBootImage);
+#endif
 
 
 //
@@ -107,11 +117,31 @@ static struct HSS_Storage qspiStorage_ = {
     .getInfo = HSS_CachedQSPI_GetInfo,
     .flushWriteBuffer = HSS_CachedQSPI_FlushWriteBuffer
 };
+#if IS_ENABLED(CONFIG_SERVICE_BOOT_REDUNDANT_QSPI)
+/*
+ * Boot path: uncached, no device-sized DDR cache.  Excluded from the boot
+ * iteration below so a boot failure cannot trigger HSS_CachedQSPIInit() and
+ * allocate 256 MiB of DDR on the production part.
+ */
+static struct HSS_Storage qspiRedundantStorage_ = {
+    .name = "QSPI-RS",
+    .getBootImage = getBootImageFromRedundantQSPI_,
+    .init = HSS_QSPIInit,
+    .readBlock = HSS_QSPI_ReadBlock,
+    .writeBlock = NULL,
+    .getInfo = HSS_QSPI_GetInfo,
+    .flushWriteBuffer = NULL
+};
+#endif
 #endif
 #if IS_ENABLED(CONFIG_SERVICE_MMC)
 static struct HSS_Storage mmcStorage_ = {
     .name = "MMC",
+#if IS_ENABLED(CONFIG_SERVICE_BOOT_REDUNDANT_MMC)
+    .getBootImage = getBootImageFromRedundantMMC_,
+#else
     .getBootImage = getBootImageFromMMC_,
+#endif
     .init = HSS_MMCInit,
     .readBlock = HSS_MMC_ReadBlock,
     .writeBlock = HSS_MMC_WriteBlockSDMA,
@@ -159,7 +189,11 @@ static struct HSS_Storage *pStorages[] =
 	&snvmStorage_,
 #endif
 #if IS_ENABLED(CONFIG_SERVICE_QSPI)
+#  if IS_ENABLED(CONFIG_SERVICE_BOOT_REDUNDANT_QSPI)
+	&qspiRedundantStorage_,
+#  else
 	&qspiStorage_,
+#  endif
 #endif
 #if IS_ENABLED(CONFIG_SERVICE_SPI)
 	&spiStorage_,
@@ -431,6 +465,19 @@ static bool getBootImageFromMMC_(struct HSS_Storage *pStorage, struct HSS_BootIm
     return result;
 }
 
+#if IS_ENABLED(CONFIG_SERVICE_BOOT_REDUNDANT_MMC)
+static bool getBootImageFromRedundantMMC_(struct HSS_Storage *pStorage, struct HSS_BootImage **ppBootImage)
+{
+    const bool result = HSS_Boot_GetSlotImage(pStorage, ppBootImage);
+
+    if (result) {
+        pDefaultStorage = &mmcStorage_;
+    }
+
+    return result;
+}
+#endif
+
 void HSS_BootSelectSDCARD(void)
 {
 #if IS_ENABLED(CONFIG_SERVICE_MMC)
@@ -533,6 +580,20 @@ void HSS_BootSelectQSPI(void)
     (void)getBootImageFromQSPI_;
 #endif
 }
+
+#if IS_ENABLED(CONFIG_SERVICE_BOOT_REDUNDANT_QSPI)
+static bool getBootImageFromRedundantQSPI_(struct HSS_Storage *pStorage, struct HSS_BootImage **ppBootImage)
+{
+    const bool result = HSS_Boot_GetSlotImage(pStorage, ppBootImage);
+
+    if (result) {
+        /* keep USBDMSC on its cached read-modify-write path */
+        pDefaultStorage = &qspiStorage_;
+    }
+
+    return result;
+}
+#endif
 
 static bool getBootImageFromPayload_(struct HSS_Storage *pStorage, struct HSS_BootImage **ppBootImage)
 {

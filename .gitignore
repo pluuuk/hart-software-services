@@ -18,3 +18,6 @@ build/
 
 # built payload-generator binary
 tools/hss-payload-generator/hss-payload-generator
+
+# generated redundant slot layout header
+services/boot/hss_slot_layout.h

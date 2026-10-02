@@ -64,6 +64,32 @@ config SERVICE_BOOT_MAX_IMAGE_SIZE
                 raise this above the kernel plus device tree size to use the
                 direct kernel boot flow (tools/direct-kernel).
 
+config SERVICE_BOOT_REDUNDANT
+	bool "Redundant slot boot"
+	default n
+	depends on SERVICE_BOOT
+	help
+	  Enable the redundant slot boot walker: N version slots, each
+	  replicated M times, validated by per-copy header CRC and payload
+	  CRC32 before the first good copy is staged (N=2, M=3 by default).
+	  Replaces the selected storage's single-image lookup; the stock
+	  boot service and the payload blob format are unchanged.
+
+choice
+	prompt "Redundant slot boot storage"
+	default SERVICE_BOOT_REDUNDANT_QSPI
+	depends on SERVICE_BOOT_REDUNDANT
+
+config SERVICE_BOOT_REDUNDANT_QSPI
+	bool "QSPI"
+	depends on SERVICE_QSPI
+
+config SERVICE_BOOT_REDUNDANT_MMC
+	bool "MMC"
+	depends on SERVICE_MMC
+
+endchoice
+
 config SERVICE_BOOT_MMC_USE_GPT
     bool "Use GPT with MMC"
     default SERVICE_BOOT && SERVICE_MMC && y
