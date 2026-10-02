@@ -14,6 +14,7 @@
 #
 import argparse
 import binascii
+import os
 import struct
 import sys
 
@@ -113,6 +114,12 @@ def emit_header(layout, path):
         f.write("#define HSS_SLOT_CAPACITY 0x%08xu\n" % layout["capacity"])
         f.write("#define HSS_SLOT_COUNT    %uu\n" % layout["slots"])
         f.write("#define HSS_SLOT_COPIES   %uu\n" % layout["copies"])
+    hdr_dir = os.path.dirname(os.path.abspath(path))
+    walker = os.path.join(hdr_dir, "hss_boot_slotimage.c")
+    if os.path.exists(walker):
+        # The build has no dependency edge on this header (it is picked up by
+        # __has_include), so a re-emit would otherwise reuse a stale object.
+        os.utime(walker)
     print("wrote %s" % path)
 
 
