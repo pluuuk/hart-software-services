@@ -137,17 +137,24 @@ static struct HSS_Storage qspiRedundantStorage_ = {
 #if IS_ENABLED(CONFIG_SERVICE_MMC)
 static struct HSS_Storage mmcStorage_ = {
     .name = "MMC",
-#if IS_ENABLED(CONFIG_SERVICE_BOOT_REDUNDANT_MMC)
-    .getBootImage = getBootImageFromRedundantMMC_,
-#else
     .getBootImage = getBootImageFromMMC_,
-#endif
     .init = HSS_MMCInit,
     .readBlock = HSS_MMC_ReadBlock,
     .writeBlock = HSS_MMC_WriteBlockSDMA,
     .getInfo = HSS_MMC_GetInfo,
     .flushWriteBuffer = NULL
 };
+#if IS_ENABLED(CONFIG_SERVICE_BOOT_REDUNDANT_MMC)
+static struct HSS_Storage mmcRedundantStorage_ = {
+    .name = "MMC-RS",
+    .getBootImage = getBootImageFromRedundantMMC_,
+    .init = HSS_MMCInit,
+    .readBlock = HSS_MMC_ReadBlock,
+    .writeBlock = HSS_MMC_WriteBlockSDMA,
+    .getInfo = HSS_MMC_GetInfo,
+    .flushWriteBuffer = NULL
+};
+#endif
 #endif
 #if IS_ENABLED(CONFIG_SERVICE_SPI)
 static struct HSS_Storage spiStorage_ = {
@@ -199,7 +206,11 @@ static struct HSS_Storage *pStorages[] =
 	&spiStorage_,
 #endif
 #if IS_ENABLED(CONFIG_SERVICE_MMC)
+#  if IS_ENABLED(CONFIG_SERVICE_BOOT_REDUNDANT_MMC)
+	&mmcRedundantStorage_,
+#  else
 	&mmcStorage_,
+#  endif
 #endif
 #if IS_ENABLED(CONFIG_SERVICE_BOOT_USE_PAYLOAD)
 	&payloadStorage_,
