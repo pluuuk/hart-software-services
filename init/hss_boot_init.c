@@ -479,13 +479,20 @@ static bool getBootImageFromMMC_(struct HSS_Storage *pStorage, struct HSS_BootIm
 #if IS_ENABLED(CONFIG_SERVICE_BOOT_REDUNDANT_MMC)
 static bool getBootImageFromRedundantMMC_(struct HSS_Storage *pStorage, struct HSS_BootImage **ppBootImage)
 {
-    const bool result = HSS_Boot_GetSlotImage(pStorage, ppBootImage);
-
-    if (result) {
+    if (HSS_Boot_GetSlotImage(pStorage, ppBootImage)) {
         pDefaultStorage = &mmcStorage_;
+        return true;
     }
 
-    return result;
+    /* No valid slot: fall back to the standard boot image (GPT partition or
+     * offset 0) so the board stays recoverable with redundant boot enabled.
+     * The slot map starts at 0x10000 with its own magic, so offset 0 is free
+     * for a normal payload. */
+    mHSS_DEBUG_PRINTF(LOG_WARN,
+        "SLOT: no valid slot on %s; falling back to standard boot\n",
+        pStorage->name);
+
+    return getBootImageFromMMC_(pStorage, ppBootImage);
 }
 #endif
 
@@ -595,14 +602,26 @@ void HSS_BootSelectQSPI(void)
 #if IS_ENABLED(CONFIG_SERVICE_BOOT_REDUNDANT_QSPI)
 static bool getBootImageFromRedundantQSPI_(struct HSS_Storage *pStorage, struct HSS_BootImage **ppBootImage)
 {
-    const bool result = HSS_Boot_GetSlotImage(pStorage, ppBootImage);
-
-    if (result) {
+    if (HSS_Boot_GetSlotImage(pStorage, ppBootImage)) {
         /* keep USBDMSC on its cached read-modify-write path */
         pDefaultStorage = &qspiStorage_;
+        return true;
     }
 
-    return result;
+    /* No valid slot: fall back to a standard boot image at offset 0 so the
+     * board stays recoverable with redundant boot enabled.  getBootImageFromQSPI_
+     * reads through HSS_QSPI_ReadBlock (uncached), so this does not allocate
+     * the device-sized cache. */
+    mHSS_DEBUG_PRINTF(LOG_WARN,
+        "SLOT: no valid slot on %s; falling back to standard boot\n",
+        pStorage->name);
+
+    if (getBootImageFromQSPI_(pStorage, ppBootImage)) {
+        pDefaultStorage = &qspiStorage_;
+        return true;
+    }
+
+    return false;
 }
 #endif
 

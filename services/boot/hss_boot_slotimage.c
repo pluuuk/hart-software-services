@@ -291,9 +291,7 @@ bool HSS_Boot_GetSlotImage(struct HSS_Storage *pStorage,
             'A' + slot, HSS_SLOT_COPIES);
     }
 
-    mHSS_DEBUG_PRINTF(LOG_ERROR,
-        "SLOT: all slots exhausted - remaining in HSS CLI; use YMODEM to "
-        "reflash\n");
+    mHSS_DEBUG_PRINTF(LOG_ERROR, "SLOT: all slots exhausted\n");
 
     return false;
 }
