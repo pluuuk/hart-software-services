@@ -62,6 +62,7 @@ struct FlashDescriptor
 } qspiFlashes[] = {
     { 0xEFAA21u, 2048u, 64u, 1024u, SPI_NAND, "Winbond W25N01GV" }, // EFh => Winbond, AA21h => W25N01GV
     { 0x20BA19u, 256u, 256u, 512u, SPI_NOR, "Micron N25Q256A" }, // 20h => Micron, BA91h => N25Q256A, and using sector as block
+    { 0x20BB22u, 256u, 256u, 4096u, SPI_NOR, "Micron MT25QU02G" }, // 20h => Micron, BB22h => MT25QU02G (2Gb/256MiB), 64KiB sector as block
 };
 
 static uint32_t pageSize, blockSize, dieSize, eraseSize, pageCount, blockCount;
@@ -360,8 +361,15 @@ bool HSS_QSPIInit(void)
 
             eraseSize = blockSize;
             blockCount = qspiFlashes[qspiIndex].blocksPerDie;
-            pageCount = qspiFlashes[qspiIndex].pagesPerBlock * blockCount;
-            dieSize = blockSize * blockCount;
+            /* True device capacity, from the descriptor geometry.  blockSize may
+             * have been doubled above to give sub-512-byte-page parts a usable
+             * block-device sector size; deriving dieSize from it over-reports
+             * (e.g. 64MiB for a 32MiB N25Q256A) and would loosen the bounds
+             * guard in HSS_QSPI_ReadBlock()/HSS_QSPI_WriteBlock(). */
+            dieSize = qspiFlashes[qspiIndex].pageSize *
+                      qspiFlashes[qspiIndex].pagesPerBlock *
+                      blockCount;
+            pageCount = dieSize / pageSize;
             spi_type = qspiFlashes[qspiIndex].type;
 
             // mHSS_DEBUG_PRINTF(LOG_NORMAL, "pageSize: %u\n", pageSize);
