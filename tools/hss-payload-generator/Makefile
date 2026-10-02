@@ -96,7 +96,7 @@ $(build_dir)/%.o: %.c blob_handler.h crc32.h debug_printf.h dump_payload.h elf_p
 TARGET := $(build_dir)/hss-payload-generator
 all: $(TARGET)
 
-.PHONY: clean cppcheck
+.PHONY: clean cppcheck check
 
 $(TARGET): $(OBJS)
 	@$(ECHO) " LD        $@";
@@ -113,3 +113,6 @@ clean:
 cppcheck: $(SRCS)
 	cppcheck --suppress=missingIncludeSystem -v --enable=all --inconclusive --std=posix \
                  $(INCLUDES) --force . >cppcheck.log 2>&1
+
+check: $(TARGET)
+	@bash test/test-firstchunk.sh

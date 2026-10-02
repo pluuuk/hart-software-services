@@ -488,6 +488,16 @@ void generate_payload(char const * const filename_output, char const * const pri
 		exit(EXIT_FAILURE);
 	}
 
+	/* firstChunk/lastChunk are only meaningful for harts that own chunks.
+	 * Normalize the unassigned sentinel back to zero so the on-disk header is
+	 * byte-identical to the pre-sentinel format for unused harts. */
+	for (size_t i = 0u; i < ARRAY_SIZE(bootImage.hart); i++) {
+		if (bootImage.hart[i].numChunks == 0u) {
+			bootImage.hart[i].firstChunk = 0u;
+			bootImage.hart[i].lastChunk = 0u;
+		}
+	}
+
 	generate_header(pFileOut, &bootImage);
 	generate_chunks(pFileOut);
 	generate_ziChunks(pFileOut);
@@ -571,4 +581,11 @@ void generate_init(void)
 {
 	bootImage.magic = mHSS_BOOT_MAGIC;
 	bootImage.version = mHSS_BOOT_VERSION;
+
+	/* firstChunk == 0 is a valid chunk index, so zero-init cannot double as
+	 * "unassigned".  Mark every hart unassigned so a second payload on the
+	 * same owner hart does not overwrite (and orphan) the first one's chunks. */
+	for (size_t i = 0u; i < ARRAY_SIZE(bootImage.hart); i++) {
+		bootImage.hart[i].firstChunk = (size_t)-1;
+	}
 }

@@ -292,7 +292,7 @@ bool elf_parser(char const * const filename, size_t owner, uintptr_t base_entry_
 		result = false;
 	} else {
 		debug_printf(1, "\nProcessing ELF >>%s<<\n", filename);
-		if (!bootImage.hart[owner-1].firstChunk) {
+		if (bootImage.hart[owner-1].firstChunk == (size_t)-1) {
 			bootImage.hart[owner-1].firstChunk= numChunks;
 		}
 

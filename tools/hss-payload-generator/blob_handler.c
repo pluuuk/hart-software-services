@@ -98,7 +98,7 @@ bool blob_handler(char const * const filename, uintptr_t exec_addr, size_t owner
 
 	assert(filename);
 
-	if (!bootImage.hart[owner-1].firstChunk) {
+	if (bootImage.hart[owner-1].firstChunk == (size_t)-1) {
 		bootImage.hart[owner-1].firstChunk = numChunks;
 	}
 
@@ -141,7 +141,7 @@ bool blob_handler(char const * const filename, uintptr_t exec_addr, size_t owner
 		process_blob(pBuffer, exec_addr, size, owner, false); // deliberately orphaning pBuffer for simplicity
 
 		bootImage.hart[owner-1].lastChunk = numChunks - 1u;
-		bootImage.hart[owner-1].numChunks += 1u;
+		bootImage.hart[owner-1].numChunks = bootImage.hart[owner-1].lastChunk - bootImage.hart[owner-1].firstChunk + 1u;
 		debug_printf(1, "lastChunk is %d, numChunks is %d\n", bootImage.hart[owner-1].lastChunk, bootImage.hart[owner-1].numChunks);
 
 		fclose(fileIn);
@@ -174,7 +174,7 @@ bool blob_handler(char const * const filename, uintptr_t exec_addr, size_t owner
 		process_blob(pBuffer, exec_addr, size, owner, true); // deliberately orphaning pBuffer for simplicity
 
 		bootImage.hart[owner-1].lastChunk = numChunks - 1u;
-		bootImage.hart[owner-1].numChunks += 1u;
+		bootImage.hart[owner-1].numChunks = bootImage.hart[owner-1].lastChunk - bootImage.hart[owner-1].firstChunk + 1u;
 		debug_printf(1, "lastChunk is %d, numChunks is %d\n", bootImage.hart[owner-1].lastChunk, bootImage.hart[owner-1].numChunks);
 
 		fclose(fileIn);
