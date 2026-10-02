@@ -196,8 +196,12 @@ bool HSS_Boot_GetSlotImage(struct HSS_Storage *pStorage,
     slotBlockSize_ = pageSize ? pageSize : 1u;
 
     /* the constant layout must fit the actual storage */
-    if (eraseSize && pageCount) {
-        const uint64_t storageBytes = (uint64_t)eraseSize * pageCount;
+    if (pageSize && pageCount) {
+        /* total bytes = blockSize * blockCount (first x third getInfo param).
+         * For MMC eraseSize == blockSize, but for QSPI eraseSize is the erase
+         * unit while blockCount is a count of 512-byte sectors, so their
+         * product is meaningless. */
+        const uint64_t storageBytes = (uint64_t)pageSize * pageCount;
 
         if ((uint64_t)HSS_SLOT_LAYOUT_END > storageBytes) {
             mHSS_DEBUG_PRINTF(LOG_ERROR,
